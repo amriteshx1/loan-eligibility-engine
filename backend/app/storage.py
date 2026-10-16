@@ -8,14 +8,20 @@ from .config import get_settings
 
 def _client(endpoint_url: str) -> Any:
     settings = get_settings()
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        region_name=settings.s3_region,
-        aws_access_key_id=settings.s3_access_key_id,
-        aws_secret_access_key=settings.s3_secret_access_key,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
+    endpoint = endpoint_url.strip()
+    kwargs: dict[str, Any] = {
+        "region_name": settings.s3_region,
+        "config": Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path" if endpoint else "virtual"},
+        ),
+    }
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    if settings.s3_access_key_id and settings.s3_secret_access_key:
+        kwargs["aws_access_key_id"] = settings.s3_access_key_id
+        kwargs["aws_secret_access_key"] = settings.s3_secret_access_key
+    return boto3.client("s3", **kwargs)
 
 
 def create_presigned_upload(object_key: str, content_type: str) -> str:
