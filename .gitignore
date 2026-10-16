@@ -8,3 +8,6 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+node_modules/
+.serverless/
+tmp-phase5/
