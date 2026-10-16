@@ -49,7 +49,7 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-test}
       SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-loan-upload-events}
       PRESIGNED_URL_EXPIRY_SECONDS: ${PRESIGNED_URL_EXPIRY_SECONDS:-900}
-      N8N_MATCH_WEBHOOK_URL: ${N8N_MATCH_WEBHOOK_URL:-}
+      N8N_MATCH_WEBHOOK_URL: ${N8N_MATCH_WEBHOOK_URL:-http://n8n:5678/webhook/user-loan-matching}
       N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET:-replace-before-enabling-workflow-b}
     ports:
       - "8000:8000"
@@ -85,7 +85,7 @@ services:
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-test}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-test}
       SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-loan-upload-events}
-      N8N_MATCH_WEBHOOK_URL: ${N8N_MATCH_WEBHOOK_URL:-}
+      N8N_MATCH_WEBHOOK_URL: ${N8N_MATCH_WEBHOOK_URL:-http://n8n:5678/webhook/user-loan-matching}
       N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET:-replace-before-enabling-workflow-b}
     depends_on:
       postgres:
