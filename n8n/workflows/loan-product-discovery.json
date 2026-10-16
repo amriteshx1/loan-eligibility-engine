@@ -1,0 +1,569 @@
+{
+  "name": "Workflow A - Loan Product Discovery",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "c5d78443-4d32-4c7c-b2de-b93c93094501",
+      "name": "Manual trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        140,
+        230
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 15 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "d00b6e1d-d0e6-4d6b-b9b2-44e9cbd85a02",
+      "name": "Daily 06:15 IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const sources = [\n  {\n    source_name: 'Discover',\n    source_url: 'https://www.discover.com/personal-loans/',\n    product_name: 'Discover Personal Loan',\n    income_currency: 'USD',\n    extraction_profile: 'discover',\n    allow_llm_fallback: false\n  },\n  {\n    source_name: 'LendingPoint',\n    source_url: 'https://www.lendingpoint.com/',\n    product_name: 'LendingPoint Personal Loan',\n    income_currency: 'USD',\n    extraction_profile: 'lendingpoint',\n    allow_llm_fallback: false\n  },\n  {\n    source_name: 'Upgrade',\n    source_url: 'https://www.upgrade.com/personal-loans/',\n    product_name: 'Upgrade Personal Loan',\n    income_currency: 'USD',\n    extraction_profile: 'upgrade',\n    allow_llm_fallback: false\n  }\n];\n\nreturn sources.map((source) => ({ json: source }));"
+      },
+      "id": "da5c6976-9351-49ba-9ef9-d8f3bb4fb603",
+      "name": "Source configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        370,
+        150
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "none",
+        "requestMethod": "GET",
+        "url": "={{ $json.source_url }}",
+        "responseFormat": "string",
+        "dataPropertyName": "html",
+        "options": {
+          "followAllRedirects": true,
+          "timeout": 30000
+        }
+      },
+      "id": "5bfe0df5-5b79-4ff0-ad7d-934d11322104",
+      "name": "Fetch public lender page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        610,
+        150
+      ],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const source = $('Source configuration').item.json;\n\nif ($json.error || typeof $json.html !== 'string' || !$json.html.trim()) {\n  return {\n    json: {\n      ...source,\n      status: 'failed',\n      failure_stage: 'http_or_html',\n      error_message: $json.error ? 'HTTP request failed' : 'Response did not contain HTML',\n      llm_used: false\n    }\n  };\n}\n\nconst decode = (value) => value\n  .replace(/&nbsp;|&#160;/gi, ' ')\n  .replace(/&amp;/gi, '&')\n  .replace(/&quot;|&#34;/gi, '\"')\n  .replace(/&#39;|&apos;/gi, \"'\")\n  .replace(/&lt;/gi, '<')\n  .replace(/&gt;/gi, '>');\n\nconst text = decode(\n  $json.html\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<script\\b[^>]*>[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style\\b[^>]*>[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript\\b[^>]*>[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\u200b/g, '')\n    .replace(/\\s+/g, ' ')\n).trim();\n\nif (text.length < 200) {\n  return {\n    json: {\n      ...source,\n      status: 'failed',\n      failure_stage: 'html_cleanup',\n      error_message: 'Cleaned page text was unexpectedly short',\n      llm_used: false\n    }\n  };\n}\n\nconst evidence = [];\nconst qualitative = [];\nconst addEvidence = (field, snippet) => {\n  const clean = String(snippet || '').replace(/\\s+/g, ' ').trim();\n  if (clean && !evidence.some((entry) => entry.field === field && entry.snippet === clean)) {\n    evidence.push({ field, snippet: clean.slice(0, 700) });\n  }\n};\nconst addQualitative = (criterion, snippet) => {\n  if (!qualitative.includes(criterion)) qualitative.push(criterion);\n  addEvidence('qualitative_criteria', snippet || criterion);\n};\nconst rateMatch = text.match(/(\\d{1,2}(?:\\.\\d{1,3})?)\\s*%\\s*(?:-|–|to)\\s*(\\d{1,2}(?:\\.\\d{1,3})?)\\s*%\\s*(?:APR)?/i);\nconst annualIncomeMatch = text.match(/minimum\\s+(?:individual\\s+or\\s+household\\s+)?annual\\s+income\\s+(?:of\\s+)?(?:at\\s+least\\s+)?\\$\\s*([\\d,]+)/i);\nconst ageMatch = text.match(/(?:(?:be\\s+)?at\\s+least\\s+(\\d{2})\\s+years?(?:\\s+of\\s+age|\\s+old))|(?:\\bbe\\s+)?(\\d{2})\\s+years?(?:\\s+of\\s+age)?\\s+or\\s+older/i);\nconst monthlyIncome = annualIncomeMatch\n  ? Math.round((Number(annualIncomeMatch[1].replace(/,/g, '')) / 12) * 100) / 100\n  : null;\n\nlet minInterestRate = rateMatch ? Number(rateMatch[1]) : null;\nlet maxInterestRate = rateMatch ? Number(rateMatch[2]) : null;\nlet minAge = ageMatch ? Number(ageMatch[1] || ageMatch[2]) : null;\nlet minMonthlyIncome = monthlyIncome;\n\nif (rateMatch) addEvidence('interest_rate', rateMatch[0]);\nif (annualIncomeMatch) addEvidence('minimum_monthly_income', annualIncomeMatch[0]);\nif (ageMatch) addEvidence('age_min', ageMatch[0]);\n\nif (source.extraction_profile === 'discover') {\n  if (/valid\\s+U\\.?S\\.?\\s+SSN/i.test(text)) addQualitative('Valid U.S. Social Security number required', 'Have a valid U.S. SSN.');\n  if (/physical\\s+address/i.test(text)) addQualitative('Physical address required', 'Have a physical address.');\n  if (/active\\s+email\\s+address/i.test(text)) addQualitative('Active email address and online-finalization access required', 'Have an active email address and access to a computer or mobile device to finalize the application online.');\n}\n\nif (source.extraction_profile === 'lendingpoint') {\n  if (/government-issued\\s+photo\\s+ID/i.test(text)) addQualitative('Government-issued photo ID required', 'Be able to provide a U.S federal, state, or local government-issued photo ID.');\n  if (/have\\s+a\\s+social\\s+security\\s+number/i.test(text)) addQualitative('Social Security number required', 'Have a social security number.');\n  if (/verifiable\\s+personal\\s+banking\\s+account/i.test(text)) addQualitative('Verifiable personal bank account required', 'Have a verifiable personal banking account in your name.');\n  if (/not\\s+reside\\s+in\\s+Nevada\\s+or\\s+West\\s+Virginia/i.test(text)) addQualitative('Not available to Nevada or West Virginia residents', 'Not reside in Nevada or West Virginia.');\n}\n\nif (source.extraction_profile === 'upgrade') {\n  if (/U\\.?S\\.?\\s+citizen,?\\s+a\\s+permanent\\s+resident,?\\s+or\\s+living\\s+in\\s+the\\s+U\\.?S\\.?\\s+on\\s+a\\s+valid\\s+visa/i.test(text)) addQualitative('U.S. citizen, permanent resident, or valid U.S. visa required', 'Be a U.S. citizen, a permanent resident, or living in the U.S. on a valid visa.');\n  if (/verifiable\\s+bank\\s+account\\s+information/i.test(text)) addQualitative('Verifiable bank account information required', 'Be able to provide verifiable bank account information and a valid email address.');\n  if (/credit\\s+score,\\s+credit\\s+usage,\\s+and\\s+payment\\s+history/i.test(text)) addQualitative('Credit score, credit usage, and payment history are considered', 'Eligibility for a loan through Upgrade is based on several factors, including your credit score, credit usage, and payment history.');\n}\n\nconst snippetFor = (pattern) => {\n  const found = text.search(pattern);\n  if (found < 0) return '';\n  return text.slice(Math.max(0, found - 350), Math.min(text.length, found + 1000));\n};\nconst relevantText = [\n  snippetFor(/APR/i),\n  snippetFor(/eligib/i),\n  snippetFor(/minimum\\s+(?:individual\\s+or\\s+household\\s+)?annual\\s+income/i),\n  snippetFor(/at\\s+least\\s+\\d{2}\\s+years?\\s+old/i)\n].filter(Boolean).filter((value, index, values) => values.indexOf(value) === index).join('\\n---\\n').slice(0, 6000);\n\nconst hasUnresolvedEligibilityText = /eligib|qualif|minimum\\s+credit|credit\\s+score|employment/i.test(relevantText)\n  && qualitative.length === 0;\n\nreturn {\n  json: {\n    ...source,\n    status: 'extracted',\n    min_interest_rate: minInterestRate,\n    max_interest_rate: maxInterestRate,\n    min_monthly_income: minMonthlyIncome,\n    min_credit_score: null,\n    max_credit_score: null,\n    min_age: minAge,\n    max_age: null,\n    employment_statuses: null,\n    qualitative_criteria: qualitative,\n    source_evidence: evidence,\n    relevant_text: relevantText,\n    needs_llm: Boolean(source.allow_llm_fallback && hasUnresolvedEligibilityText),\n    llm_used: false\n  }\n};"
+      },
+      "id": "5ee1ec43-5236-4661-88d4-5e3627b0b905",
+      "name": "Deterministic extraction and cleanup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        150
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_llm }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8f5c9454-7f5a-4ed6-82f5-e83e5fd1c806",
+      "name": "Needs LLM fallback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1110,
+        150
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const nullable = (type) => ({ anyOf: [{ type }, { type: 'null' }] });\nconst profileSchema = {\n  type: 'object',\n  additionalProperties: false,\n  properties: {\n    product_name: { type: 'string' },\n    min_interest_rate: nullable('number'),\n    max_interest_rate: nullable('number'),\n    min_monthly_income: nullable('number'),\n    income_currency: nullable('string'),\n    min_credit_score: nullable('integer'),\n    max_credit_score: nullable('integer'),\n    min_age: nullable('integer'),\n    max_age: nullable('integer'),\n    employment_statuses: { type: 'array', items: { type: 'string' } },\n    qualitative_criteria: { type: 'array', items: { type: 'string' } },\n    evidence: { type: 'array', items: { type: 'string' } }\n  },\n  required: [\n    'product_name', 'min_interest_rate', 'max_interest_rate',\n    'min_monthly_income', 'income_currency', 'min_credit_score',\n    'max_credit_score', 'min_age', 'max_age', 'employment_statuses',\n    'qualitative_criteria', 'evidence'\n  ]\n};\n\nconst instructions = [\n  'Extract only eligibility facts explicitly supported by the supplied lender text.',\n  'This is a normalization fallback, not a lending decision.',\n  'Use null when a numeric field is absent, ambiguous, or only generally considered.',\n  'Never infer a cutoff from marketing, examples, or typical lender practice.',\n  'Only list employment statuses when the source explicitly states they are accepted or required.',\n  'Keep unresolved requirements as concise qualitative_criteria strings.',\n  'Every evidence item must be a short quotation or faithful excerpt from the supplied text.',\n  'Return JSON only.'\n].join(' ');\n\nconst llmRequest = {\n  model: 'gpt-4o-mini',\n  temperature: 0,\n  messages: [\n    { role: 'system', content: instructions },\n    {\n      role: 'user',\n      content: 'Source URL: ' + $json.source_url + '\\nKnown product name: ' + $json.product_name + '\\nCleaned eligibility/product excerpts only:\\n' + $json.relevant_text\n    }\n  ],\n  response_format: {\n    type: 'json_schema',\n    json_schema: {\n      name: 'loan_eligibility_profile',\n      strict: true,\n      schema: profileSchema\n    }\n  }\n};\n\nreturn { json: { ...$json, llm_request: llmRequest } };"
+      },
+      "id": "e4be6bb1-ec80-4217-8f72-d598c1d9c307",
+      "name": "Build scoped LLM request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1350,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "responseFormat": "json",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.llm_request) }}",
+        "headerParametersJson": "{\"Content-Type\":\"application/json\"}",
+        "options": {
+          "bodyContentType": "json",
+          "timeout": 45000
+        }
+      },
+      "id": "42708ce7-8b50-431f-98f2-63d8f0f69a08",
+      "name": "LLM structured extraction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1590,
+        40
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const original = $('Build scoped LLM request').item.json;\n\nif ($json.error) {\n  return {\n    json: {\n      ...original,\n      status: 'failed',\n      failure_stage: 'llm_request',\n      error_message: 'LLM request failed',\n      llm_used: true\n    }\n  };\n}\n\nconst content = $json.choices && $json.choices[0] && $json.choices[0].message\n  ? $json.choices[0].message.content\n  : null;\nlet extracted;\ntry {\n  extracted = typeof content === 'string' ? JSON.parse(content) : null;\n} catch (error) {\n  extracted = null;\n}\n\nif (!extracted || typeof extracted !== 'object' || Array.isArray(extracted)) {\n  return {\n    json: {\n      ...original,\n      status: 'failed',\n      failure_stage: 'llm_parse',\n      error_message: 'LLM response did not contain a JSON object matching the requested profile',\n      llm_used: true\n    }\n  };\n}\n\nconst numericFields = [\n  'min_interest_rate', 'max_interest_rate', 'min_monthly_income',\n  'min_credit_score', 'max_credit_score', 'min_age', 'max_age'\n];\nfor (const field of numericFields) {\n  if (extracted[field] !== null && !Number.isFinite(extracted[field])) {\n    return {\n      json: {\n        ...original,\n        status: 'failed',\n        failure_stage: 'llm_validation',\n        error_message: 'LLM returned a non-numeric value for ' + field,\n        llm_used: true\n      }\n    };\n  }\n}\nif (!Array.isArray(extracted.employment_statuses) || !Array.isArray(extracted.qualitative_criteria) || !Array.isArray(extracted.evidence)) {\n  return {\n    json: {\n      ...original,\n      status: 'failed',\n      failure_stage: 'llm_validation',\n      error_message: 'LLM returned an invalid array field',\n      llm_used: true\n    }\n  };\n}\n\nconst filledOnlyWhenUnknown = {};\nfor (const field of numericFields) {\n  filledOnlyWhenUnknown[field] = original[field] === null && extracted[field] !== null\n    ? extracted[field]\n    : original[field];\n}\nconst sourceEvidence = [\n  ...(original.source_evidence || []),\n  ...extracted.evidence.filter((value) => typeof value === 'string' && value.trim()).map((snippet) => ({\n    field: 'llm_eligibility',\n    snippet: snippet.trim().slice(0, 700)\n  }))\n];\n\nreturn {\n  json: {\n    ...original,\n    ...filledOnlyWhenUnknown,\n    income_currency: original.income_currency || extracted.income_currency || null,\n    employment_statuses: original.employment_statuses === null && extracted.employment_statuses.length ? extracted.employment_statuses : original.employment_statuses,\n    qualitative_criteria: [...new Set([...(original.qualitative_criteria || []), ...extracted.qualitative_criteria.filter((value) => typeof value === 'string' && value.trim())])],\n    source_evidence: sourceEvidence,\n    status: 'extracted',\n    llm_used: true\n  }\n};"
+      },
+      "id": "96a1b6cc-53d0-4e12-a544-2c2fe63e7209",
+      "name": "Parse and validate LLM JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1830,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const profile = { ...$json };\n\nif (profile.status === 'failed') {\n  return { json: { ...profile, valid: false } };\n}\n\nconst numericFields = [\n  'min_interest_rate', 'max_interest_rate', 'min_monthly_income',\n  'min_credit_score', 'max_credit_score', 'min_age', 'max_age'\n];\nconst fieldRange = {\n  min_interest_rate: [0, 100],\n  max_interest_rate: [0, 100],\n  min_monthly_income: [0, 100000000],\n  min_credit_score: [0, 1000],\n  max_credit_score: [0, 1000],\n  min_age: [0, 130],\n  max_age: [0, 130]\n};\nfor (const field of numericFields) {\n  const value = profile[field];\n  if (value === null || value === undefined) {\n    profile[field] = null;\n    continue;\n  }\n  if (!Number.isFinite(value) || value < fieldRange[field][0] || value > fieldRange[field][1]) {\n    return {\n      json: {\n        ...profile,\n        status: 'failed',\n        failure_stage: 'profile_validation',\n        error_message: 'Out-of-range or non-numeric ' + field,\n        valid: false\n      }\n    };\n  }\n}\nif ((profile.min_interest_rate !== null && profile.max_interest_rate !== null && profile.min_interest_rate > profile.max_interest_rate) ||\n    (profile.min_credit_score !== null && profile.max_credit_score !== null && profile.min_credit_score > profile.max_credit_score) ||\n    (profile.min_age !== null && profile.max_age !== null && profile.min_age > profile.max_age)) {\n  return {\n    json: {\n      ...profile,\n      status: 'failed',\n      failure_stage: 'profile_validation',\n      error_message: 'A normalized minimum exceeds its maximum',\n      valid: false\n    }\n  };\n}\nif (typeof profile.product_name !== 'string' || !profile.product_name.trim() || typeof profile.source_name !== 'string' || !/^https:\\/\\//.test(profile.source_url || '')) {\n  return {\n    json: {\n      ...profile,\n      status: 'failed',\n      failure_stage: 'profile_validation',\n      error_message: 'Missing stable product or source identity',\n      valid: false\n    }\n  };\n}\nif (typeof profile.income_currency !== 'string' || !/^[A-Z]{3}$/.test(profile.income_currency)) {\n  return {\n    json: {\n      ...profile,\n      status: 'failed',\n      failure_stage: 'profile_validation',\n      error_message: 'Income currency must be an ISO-4217 style uppercase code',\n      valid: false\n    }\n  };\n}\n\nconst employmentAliases = {\n  'salaried employee': 'salaried',\n  'salaried': 'salaried',\n  'employed': 'salaried',\n  'self employed': 'self_employed',\n  'self-employed': 'self_employed',\n  'business owner': 'self_employed',\n  'retired': 'retired',\n  'unemployed': 'unemployed',\n  'student': 'student',\n  'contractor': 'contract',\n  'contract': 'contract'\n};\nconst normalizeEmployment = (value) => employmentAliases[String(value).trim().toLowerCase()] || null;\nconst statuses = Array.isArray(profile.employment_statuses)\n  ? [...new Set(profile.employment_statuses.map(normalizeEmployment).filter(Boolean))]\n  : [];\nprofile.employment_statuses = statuses.length ? statuses : null;\nprofile.qualitative_criteria = Array.isArray(profile.qualitative_criteria)\n  ? [...new Set(profile.qualitative_criteria.map((value) => String(value).replace(/\\s+/g, ' ').trim()).filter(Boolean))]\n  : [];\nprofile.source_evidence = Array.isArray(profile.source_evidence)\n  ? profile.source_evidence.filter((entry) => entry && typeof entry.field === 'string' && typeof entry.snippet === 'string' && entry.snippet.trim()).map((entry) => ({\n      field: entry.field,\n      snippet: entry.snippet.replace(/\\s+/g, ' ').trim().slice(0, 700)\n    }))\n  : [];\ndelete profile.relevant_text;\ndelete profile.llm_request;\ndelete profile.allow_llm_fallback;\ndelete profile.extraction_profile;\ndelete profile.needs_llm;\n\nreturn { json: { ...profile, valid: true } };"
+      },
+      "id": "0e12ca84-d742-4a3b-9ba0-cae4191de110",
+      "name": "Validate normalized profile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1350,
+        270
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "90e469e7-e074-4789-a881-128547445011",
+      "name": "Profile valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1590,
+        270
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "INSERT INTO loan_products (\n  source_name, source_url, product_name,\n  interest_rate_min, interest_rate_max,\n  minimum_monthly_income, income_currency,\n  credit_score_min, credit_score_max, age_min, age_max,\n  accepted_employment_statuses, qualitative_criteria, source_evidence,\n  active, last_seen_at, updated_at\n)\nVALUES (\n  $1, $2, $3,\n  $4, $5,\n  $6, $7,\n  $8, $9, $10, $11,\n  CASE WHEN $12 IS NULL THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text($12::jsonb)) END,\n  $13::jsonb, $14::jsonb,\n  TRUE, NOW(), NOW()\n)\nON CONFLICT (source_name, source_url, product_name)\nDO UPDATE SET\n  interest_rate_min = EXCLUDED.interest_rate_min,\n  interest_rate_max = EXCLUDED.interest_rate_max,\n  minimum_monthly_income = EXCLUDED.minimum_monthly_income,\n  income_currency = EXCLUDED.income_currency,\n  credit_score_min = EXCLUDED.credit_score_min,\n  credit_score_max = EXCLUDED.credit_score_max,\n  age_min = EXCLUDED.age_min,\n  age_max = EXCLUDED.age_max,\n  accepted_employment_statuses = EXCLUDED.accepted_employment_statuses,\n  qualitative_criteria = EXCLUDED.qualitative_criteria,\n  source_evidence = EXCLUDED.source_evidence,\n  active = TRUE,\n  last_seen_at = NOW(),\n  updated_at = NOW()\nRETURNING id, source_name, source_url, product_name, last_seen_at;",
+        "options": {
+          "queryReplacement": "={{ [$json.source_name, $json.source_url, $json.product_name, $json.min_interest_rate, $json.max_interest_rate, $json.min_monthly_income, $json.income_currency, $json.min_credit_score, $json.max_credit_score, $json.min_age, $json.max_age, $json.employment_statuses ? JSON.stringify($json.employment_statuses) : null, JSON.stringify($json.qualitative_criteria ?? []), JSON.stringify($json.source_evidence ?? [])] }}"
+        }
+      },
+      "id": "b99e2b91-87a8-421c-8a4e-547582e0bd12",
+      "name": "PostgreSQL upsert loan product",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1830,
+        220
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const profile = $('Validate normalized profile').item.json;\nif ($json.error) {\n  return {\n    json: {\n      outcome: 'failure',\n      source_name: profile.source_name,\n      product_name: profile.product_name,\n      failure_stage: 'database',\n      error_message: 'PostgreSQL upsert failed',\n      llm_used: Boolean(profile.llm_used)\n    }\n  };\n}\nreturn {\n  json: {\n    outcome: 'upserted',\n    source_name: profile.source_name,\n    product_name: profile.product_name,\n    product_id: $json.id,\n    llm_used: Boolean(profile.llm_used)\n  }\n};"
+      },
+      "id": "ac56ea48-66e0-45f5-85fa-5456f4a34313",
+      "name": "Record upsert outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2070,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return {\n  json: {\n    outcome: 'failure',\n    source_name: $json.source_name || 'unknown',\n    product_name: $json.product_name || 'unknown',\n    failure_stage: $json.failure_stage || 'profile_validation',\n    error_message: $json.error_message || 'Profile was not safe to persist',\n    llm_used: Boolean($json.llm_used)\n  }\n};"
+      },
+      "id": "8691c96c-bbc0-4aac-b11b-1c1d390f3914",
+      "name": "Record failure outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1830,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2
+      },
+      "id": "449c7a29-f3ce-445a-af1e-a2525a50c015",
+      "name": "Collect outcomes",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2310,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const outcomes = $input.all().map((item) => item.json);\nconst summary = {\n  sources_processed: outcomes.length,\n  products_extracted: outcomes.filter((item) => item.outcome === 'upserted').length,\n  products_upserted: outcomes.filter((item) => item.outcome === 'upserted').length,\n  llm_extractions: outcomes.filter((item) => item.llm_used).length,\n  extraction_failures: outcomes.filter((item) => item.outcome === 'failure').length,\n  failures: outcomes.filter((item) => item.outcome === 'failure').map((item) => ({\n    source_name: item.source_name,\n    stage: item.failure_stage,\n    error: item.error_message\n  }))\n};\nreturn [{ json: summary }];"
+      },
+      "id": "a746ea3c-8220-4e1c-a5d4-49ae5962a016",
+      "name": "Execution summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2550,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const configuredSources = $('Source configuration').all().map((item) => ({\n  source_name: item.json.source_name,\n  source_url: item.json.source_url,\n  product_name: item.json.product_name,\n}));\nconst summary = $input.first().json;\nreturn [{\n  json: {\n    ...summary,\n    configured_sources: configuredSources,\n  },\n}];"
+      },
+      "id": "7c1a0d42-6e4b-4a55-9d0e-2b6f4a91c701",
+      "name": "Prepare deactivation input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2790,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH configured AS (\n  SELECT *\n  FROM jsonb_to_recordset($1::jsonb) AS configured(\n    source_name text,\n    source_url text,\n    product_name text\n  )\n),\ndeactivated AS (\n  UPDATE loan_products AS product\n  SET active = FALSE,\n      updated_at = NOW()\n  WHERE (SELECT COUNT(*) FROM configured) > 0\n    AND product.active = TRUE\n    AND NOT EXISTS (\n      SELECT 1\n      FROM configured\n      WHERE product.source_name = configured.source_name\n        AND product.source_url = configured.source_url\n        AND product.product_name = configured.product_name\n    )\n  RETURNING product.id\n)\nSELECT COUNT(*)::int AS products_deactivated FROM deactivated;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.configured_sources)] }}"
+        }
+      },
+      "id": "8d2b1e53-7f5c-4b66-ae1f-3c705b02d812",
+      "name": "Deactivate removed products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3030,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const summary = $('Prepare deactivation input').first().json;\nconst { configured_sources, ...publicSummary } = summary;\nreturn {\n  json: {\n    ...publicSummary,\n    products_deactivated: Number($json.products_deactivated || 0),\n  },\n};"
+      },
+      "id": "9e3c2f64-806d-4c77-bf20-4d816c13e923",
+      "name": "Final execution summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3270,
+        290
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Source configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 06:15 IST": {
+      "main": [
+        [
+          {
+            "node": "Source configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Source configuration": {
+      "main": [
+        [
+          {
+            "node": "Fetch public lender page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch public lender page": {
+      "main": [
+        [
+          {
+            "node": "Deterministic extraction and cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deterministic extraction and cleanup": {
+      "main": [
+        [
+          {
+            "node": "Needs LLM fallback?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs LLM fallback?": {
+      "main": [
+        [
+          {
+            "node": "Build scoped LLM request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate normalized profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build scoped LLM request": {
+      "main": [
+        [
+          {
+            "node": "LLM structured extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM structured extraction": {
+      "main": [
+        [
+          {
+            "node": "Parse and validate LLM JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and validate LLM JSON": {
+      "main": [
+        [
+          {
+            "node": "Validate normalized profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate normalized profile": {
+      "main": [
+        [
+          {
+            "node": "Profile valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Profile valid?": {
+      "main": [
+        [
+          {
+            "node": "PostgreSQL upsert loan product",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record failure outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PostgreSQL upsert loan product": {
+      "main": [
+        [
+          {
+            "node": "Record upsert outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record upsert outcome": {
+      "main": [
+        [
+          {
+            "node": "Collect outcomes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record failure outcome": {
+      "main": [
+        [
+          {
+            "node": "Collect outcomes",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Collect outcomes": {
+      "main": [
+        [
+          {
+            "node": "Execution summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execution summary": {
+      "main": [
+        [
+          {
+            "node": "Prepare deactivation input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare deactivation input": {
+      "main": [
+        [
+          {
+            "node": "Deactivate removed products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deactivate removed products": {
+      "main": [
+        [
+          {
+            "node": "Final execution summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "versionId": "e3cc43ec-dd0e-4168-a0d1-e792d465c141",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
