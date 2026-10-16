@@ -1,0 +1,286 @@
+{
+  "name": "Workflow C - User Notification",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "user-notification",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000001",
+      "name": "Notification webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "user-notification",
+      "notes": "Workflow B calls this with batch_id after matching completes.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const source = $json.body ?? $json;\nlet raw = source;\nif (typeof raw === 'string') {\n  try {\n    raw = JSON.parse(raw);\n  } catch (error) {\n    raw = {};\n  }\n}\nconst batchId = String(raw.batch_id || '').trim().toLowerCase();\nif (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(batchId)) {\n  throw new Error('batch_id must be a UUID');\n}\nreturn [{ json: { batch_id: batchId } }];"
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000002",
+      "name": "Read notification request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH requested AS (\n  SELECT $1::uuid AS batch_id\n),\nbatch AS (\n  SELECT\n    requested.batch_id,\n    COALESCE(b.status, '') AS status\n  FROM requested\n  LEFT JOIN ingestion_batches b ON b.id = requested.batch_id\n),\nunnotified AS (\n  SELECT\n    u.id AS user_record_id,\n    u.user_id,\n    COUNT(*)::int AS match_count,\n    jsonb_agg(\n      jsonb_build_object(\n        'match_id', m.id,\n        'product_name', p.product_name,\n        'source_name', p.source_name,\n        'interest_rate_min', p.interest_rate_min,\n        'interest_rate_max', p.interest_rate_max,\n        'match_reason', COALESCE(m.match_reason, '')\n      )\n      ORDER BY p.product_name, m.id\n    ) AS products\n  FROM matches m\n  JOIN users u ON u.id = m.user_record_id\n  JOIN loan_products p ON p.id = m.product_id\n  JOIN requested ON requested.batch_id = m.batch_id\n  WHERE m.notified_at IS NULL\n  GROUP BY u.id, u.user_id\n)\nSELECT\n  batch.batch_id,\n  batch.status,\n  (\n    SELECT COUNT(*)::int\n    FROM matches m\n    WHERE m.batch_id = batch.batch_id\n      AND m.notified_at IS NULL\n  ) AS unnotified_matches,\n  (\n    SELECT COUNT(*)::int\n    FROM matches m\n    WHERE m.batch_id = batch.batch_id\n      AND m.notified_at IS NOT NULL\n  ) AS notified_matches,\n  COALESCE((\n    SELECT jsonb_agg(\n      jsonb_build_object(\n        'user_record_id', user_record_id,\n        'user_id', user_id,\n        'match_count', match_count,\n        'products', products\n      )\n      ORDER BY user_record_id\n    )\n    FROM unnotified\n  ), '[]'::jsonb) AS recipients\nFROM batch",
+        "options": {
+          "queryReplacement": "={{ [$json.batch_id] }}"
+        }
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000003",
+      "name": "Load unnotified matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "function readEnv(name) {\n  try {\n    if (typeof $env !== 'undefined' && $env && $env[name]) return String($env[name]).trim();\n  } catch (error) {}\n  try {\n    if (typeof process !== 'undefined' && process.env && process.env[name]) {\n      return String(process.env[name]).trim();\n    }\n  } catch (error) {}\n  return '';\n}\n\nfunction asArray(value) {\n  if (Array.isArray(value)) return value;\n  if (typeof value === 'string' && value.trim()) {\n    const parsed = JSON.parse(value);\n    return Array.isArray(parsed) ? parsed : [];\n  }\n  return [];\n}\n\nfunction escapeHtml(value) {\n  return String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\nfunction formatPercent(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const number = Number(value);\n  if (!Number.isFinite(number)) return null;\n  return number.toFixed(3).replace(/\\.?0+$/, '') + '%';\n}\n\nfunction formatRate(min, max) {\n  const lower = formatPercent(min);\n  const upper = formatPercent(max);\n  if (lower && upper) return lower === upper ? lower : lower + ' to ' + upper;\n  if (lower) return 'from ' + lower;\n  if (upper) return 'up to ' + upper;\n  return 'not stated by the source';\n}\n\nfunction qualification(reason) {\n  const text = String(reason || '').replace(/\\s+/g, ' ').trim();\n  const fallback = 'Likely eligible based on the supplied data. This is not a guaranteed lender approval.';\n  if (!text) return fallback;\n  if (!/not a guaranteed/i.test(text)) return text + ' ' + fallback;\n  return text;\n}\n\nfunction gmailAlias(base, userId) {\n  const trimmed = String(base || '').trim().toLowerCase();\n  const match = trimmed.match(/^([a-z0-9](?:[a-z0-9.]{0,62}[a-z0-9])?)@gmail\\.com$/);\n  if (!match || trimmed.includes('+')) {\n    throw new Error('NOTIFICATION_TEST_EMAIL_BASE must be a Gmail address without a plus tag');\n  }\n  const tag = String(userId || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');\n  if (!tag) throw new Error('user_id cannot be turned into an email alias');\n  const address = match[1] + '+loan-' + tag + '@gmail.com';\n  if (!address.includes('+loan-') || address === trimmed) {\n    throw new Error('Test alias was not derived from the configured Gmail base');\n  }\n  return address;\n}\n\nconst loaded = $input.first().json;\nif (loaded.status !== 'completed') {\n  throw new Error('Notification requires a completed ingestion batch');\n}\n\nconst batchId = String(loaded.batch_id || '');\nconst recipients = asArray(loaded.recipients);\nif (!recipients.length) {\n  return [{\n    json: {\n      deliver: false,\n      batch_id: batchId,\n      notified_matches: Number(loaded.notified_matches || 0),\n      unnotified_matches: Number(loaded.unnotified_matches || 0),\n    },\n  }];\n}\n\nconst base = readEnv('NOTIFICATION_TEST_EMAIL_BASE');\nif (!base) throw new Error('NOTIFICATION_TEST_EMAIL_BASE is not set on the n8n service');\nconst fromEmail = (readEnv('SES_FROM_EMAIL') || base).trim().toLowerCase();\nif (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$/.test(fromEmail) || fromEmail.endsWith('@example.com')) {\n  throw new Error('SES_FROM_EMAIL must be a real sender address, not a sample CSV address');\n}\n\nreturn recipients.map((recipient) => {\n  const userId = String(recipient.user_id || '').replace(/[\\r\\n]+/g, ' ').trim();\n  const products = asArray(recipient.products);\n  if (!userId || !products.length) {\n    throw new Error('Unnotified match is missing a user id or product');\n  }\n  const toAddress = gmailAlias(base, userId);\n  const matchIds = products.map((product) => Number(product.match_id));\n  if (matchIds.some((id) => !Number.isInteger(id) || id <= 0)) {\n    throw new Error('Unnotified match is missing a match id');\n  }\n  const productNames = products.map((product) => String(product.product_name || '').trim());\n  if (productNames.some((name) => !name)) throw new Error('A matched product has no name');\n\n  const items = products.map((product) => {\n    return '<li>'\n      + '<p><strong>' + escapeHtml(product.product_name) + '</strong> (' + escapeHtml(product.source_name || 'source') + ')</p>'\n      + '<p>Interest-rate range: ' + escapeHtml(formatRate(product.interest_rate_min, product.interest_rate_max)) + '</p>'\n      + '<p>' + escapeHtml(qualification(product.match_reason)) + '</p>'\n      + '</li>';\n  }).join('');\n  const subject = 'Loan products you may qualify for (' + userId + ')';\n  const bodyHtml = [\n    '<p>Hello,</p>',\n    '<p>New personal-loan matches were found for user <strong>' + escapeHtml(userId) + '</strong>.</p>',\n    '<p><strong>Likely eligible based on the supplied data. This is not a guaranteed approval, and it is not a lender decision.</strong></p>',\n    '<ol>' + items + '</ol>',\n    '<p>Each product is listed with the qualification wording from its match. Requirements that were not in the supplied data remain unverified.</p>',\n  ].join('');\n  const outgoing = subject + '\\n' + bodyHtml + '\\n' + toAddress + '\\n' + fromEmail;\n  if (/example\\.com/i.test(outgoing)) {\n    throw new Error('Refusing to send because a sample CSV address would be included');\n  }\n  if (toAddress === fromEmail || !toAddress.includes('+loan-')) {\n    throw new Error('The recipient must be the derived Gmail plus alias');\n  }\n\n  return {\n    json: {\n      deliver: true,\n      batch_id: batchId,\n      user_id: userId,\n      to_address: toAddress,\n      from_email: fromEmail,\n      subject,\n      body_html: bodyHtml,\n      match_ids: matchIds,\n      product_names: productNames,\n      match_count: matchIds.length,\n    },\n  };\n});"
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000004",
+      "name": "Build notification emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-unnotified-email",
+              "leftValue": "={{ $json.deliver }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000005",
+      "name": "Has unnotified matches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "iam",
+        "resource": "email",
+        "operation": "send",
+        "fromEmail": "={{ $json.from_email }}",
+        "toAddresses": [
+          "={{ $json.to_address }}"
+        ],
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.body_html }}",
+        "isBodyHtml": true,
+        "additionalFields": {}
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000006",
+      "name": "Send match email",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        180
+      ],
+      "continueOnFail": true,
+      "notes": "Sends one email per user to the derived Gmail alias. The CSV address is never used.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "function findMessageId(value, depth) {\n  if (!value || depth > 6) return '';\n  if (typeof value !== 'object') return '';\n  if (Array.isArray(value)) {\n    for (const entry of value) {\n      const found = findMessageId(entry, depth + 1);\n      if (found) return found;\n    }\n    return '';\n  }\n  if (typeof value.MessageId === 'string' && value.MessageId.trim()) return value.MessageId.trim();\n  for (const key of Object.keys(value)) {\n    if (key === 'error' || key === 'stack') continue;\n    const found = findMessageId(value[key], depth + 1);\n    if (found) return found;\n  }\n  return '';\n}\n\nfunction errorOf(payload) {\n  if (!payload || typeof payload !== 'object') return 'SES returned an empty response';\n  if (typeof payload.error === 'string' && payload.error.trim()) return payload.error.trim();\n  if (payload.error && typeof payload.error === 'object') {\n    return String(payload.error.message || payload.error.description || 'SES send failed').trim();\n  }\n  return '';\n}\n\nfunction builtItem() {\n  try {\n    const paired = $('Build notification emails').item;\n    if (paired && paired.json && paired.json.user_id) return paired.json;\n  } catch (error) {}\n  const all = $('Build notification emails').all().map((item) => item.json).filter((item) => item.deliver === true);\n  const index = typeof $itemIndex === 'number' ? $itemIndex : 0;\n  if (all[index] && all[index].user_id) return all[index];\n  throw new Error('Could not pair the SES result with the recipient');\n}\n\nconst built = builtItem();\nconst failure = errorOf($json);\nconst messageId = failure ? '' : findMessageId($json, 0);\nconst sent = Boolean(messageId);\nlet errorMessage = '';\nif (!sent) {\n  errorMessage = failure || ('SES did not return a MessageId. Response keys: ' + Object.keys($json || {}).slice(0, 12).join(', '));\n}\n\nreturn {\n  json: {\n    batch_id: built.batch_id,\n    user_id: built.user_id,\n    to_address: built.to_address,\n    send_status: sent ? 'sent' : 'failed',\n    ses_message_id: messageId,\n    match_ids: built.match_ids,\n    product_names: built.product_names,\n    match_count: built.match_count,\n    error_message: errorMessage,\n  },\n};"
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000007",
+      "name": "Classify SES result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "WITH requested AS (\n  SELECT\n    $1::uuid AS batch_id,\n    $2::text AS send_status,\n    $3::jsonb AS match_ids,\n    $4::text AS user_id,\n    $5::text AS to_address,\n    $6::text AS ses_message_id,\n    $7::jsonb AS product_names,\n    $8::text AS error_message,\n    $9::int AS match_count\n),\nupdated AS (\n  UPDATE matches AS m\n  SET notified_at = NOW()\n  FROM requested\n  WHERE requested.send_status = 'sent'\n    AND m.batch_id = requested.batch_id\n    AND m.notified_at IS NULL\n    AND m.id IN (\n      SELECT value::bigint\n      FROM jsonb_array_elements_text((SELECT match_ids FROM requested))\n    )\n  RETURNING m.id\n)\nSELECT\n  requested.user_id,\n  requested.to_address,\n  requested.send_status,\n  NULLIF(requested.ses_message_id, '') AS ses_message_id,\n  requested.product_names,\n  NULLIF(requested.error_message, '') AS error_message,\n  requested.match_count,\n  (SELECT COUNT(*)::int FROM updated) AS rows_notified\nFROM requested",
+        "options": {
+          "queryReplacement": "={{ [$json.batch_id, $json.send_status, JSON.stringify($json.match_ids || []), $json.user_id, $json.to_address, $json.ses_message_id || '', JSON.stringify($json.product_names || []), $json.error_message || '', $json.match_count] }}"
+        }
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000008",
+      "name": "Record notification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1820,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "function asArray(value) {\n  if (Array.isArray(value)) return value;\n  if (typeof value === 'string' && value.trim()) {\n    const parsed = JSON.parse(value);\n    return Array.isArray(parsed) ? parsed : [];\n  }\n  return [];\n}\n\nconst rows = $input.all().map((item) => item.json);\nif (rows.length === 1 && rows[0].deliver === false) {\n  return [{\n    json: {\n      status: 'completed',\n      batch_id: rows[0].batch_id,\n      emails_sent: 0,\n      emails_failed: 0,\n      matches_notified: 0,\n      already_notified_matches: Number(rows[0].notified_matches || 0),\n      unnotified_matches_remaining: Number(rows[0].unnotified_matches || 0),\n      recipients: [],\n    },\n  }];\n}\n\nconst recipients = rows.map((row) => {\n  const products = asArray(row.product_names);\n  const recorded = Number(row.rows_notified || 0);\n  const expected = Number(row.match_count || products.length || 0);\n  const recordedOk = row.send_status === 'sent' && recorded === expected && expected > 0;\n  return {\n    user_id: row.user_id,\n    to_address: row.to_address,\n    products,\n    send_status: recordedOk ? 'sent' : 'failed',\n    ses_message_id: row.ses_message_id || null,\n    rows_notified: recorded,\n    match_count: expected,\n    error: recordedOk ? null : (row.error_message || 'SES send was not recorded'),\n  };\n}).sort((left, right) => String(left.user_id).localeCompare(String(right.user_id)));\n\nconst emailsSent = recipients.filter((item) => item.send_status === 'sent').length;\nconst emailsFailed = recipients.length - emailsSent;\nconst summary = {\n  status: emailsFailed === 0 ? 'completed' : 'failed',\n  batch_id: $('Read notification request').first().json.batch_id,\n  emails_sent: emailsSent,\n  emails_failed: emailsFailed,\n  matches_notified: recipients.reduce((sum, item) => sum + Number(item.rows_notified || 0), 0),\n  recipients,\n};\nif (emailsFailed > 0) {\n  throw new Error(\n    'Notification incomplete: ' + emailsFailed\n    + ' email(s) failed and were left unnotified. '\n    + JSON.stringify(summary)\n  );\n}\nreturn [{ json: summary }];"
+      },
+      "id": "c5e0a001-0000-4000-8000-000000000009",
+      "name": "Notification summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        300
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Notification webhook": {
+      "main": [
+        [
+          {
+            "node": "Read notification request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read notification request": {
+      "main": [
+        [
+          {
+            "node": "Load unnotified matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load unnotified matches": {
+      "main": [
+        [
+          {
+            "node": "Build notification emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build notification emails": {
+      "main": [
+        [
+          {
+            "node": "Has unnotified matches?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has unnotified matches?": {
+      "main": [
+        [
+          {
+            "node": "Send match email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notification summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send match email": {
+      "main": [
+        [
+          {
+            "node": "Classify SES result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify SES result": {
+      "main": [
+        [
+          {
+            "node": "Record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record notification": {
+      "main": [
+        [
+          {
+            "node": "Notification summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
