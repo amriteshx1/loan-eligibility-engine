@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Loan Eligibility Engine</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card" aria-labelledby="page-title">
+        <p class="eyebrow">Loan Eligibility Engine</p>
+        <h1 id="page-title">Upload user data</h1>
+        <p class="intro">
+          Select a UTF-8 CSV containing the required user fields. The file is
+          uploaded directly to object storage and processed asynchronously.
+        </p>
+
+        <form id="upload-form">
+          <label for="csv-file">User CSV</label>
+          <input id="csv-file" name="csv-file" type="file" accept=".csv,text/csv" required />
+          <p class="hint">
+            Required columns: user_id, email, monthly_income, credit_score,
+            employment_status, age
+          </p>
+          <button id="submit-button" type="submit">Upload CSV</button>
+        </form>
+
+        <div id="status-panel" class="status-panel" hidden aria-live="polite">
+          <div class="status-heading">
+            <span id="status-label">Preparing upload</span>
+            <span id="status-badge" class="badge">Pending</span>
+          </div>
+          <p id="status-message"></p>
+          <dl id="batch-details" hidden>
+            <div>
+              <dt>Batch ID</dt>
+              <dd id="batch-id"></dd>
+            </div>
+            <div>
+              <dt>Rows stored</dt>
+              <dd id="row-count">0</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+    </main>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
+
