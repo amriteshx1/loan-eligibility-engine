@@ -22,14 +22,17 @@ STOP_EVENT = threading.Event()
 
 def _sqs_client() -> Any:
     settings = get_settings()
-    return boto3.client(
-        "sqs",
-        endpoint_url=settings.s3_internal_endpoint_url,
-        region_name=settings.s3_region,
-        aws_access_key_id=settings.s3_access_key_id,
-        aws_secret_access_key=settings.s3_secret_access_key,
-        config=Config(signature_version="v4"),
-    )
+    endpoint = settings.s3_internal_endpoint_url.strip()
+    kwargs: dict[str, Any] = {
+        "region_name": settings.s3_region,
+        "config": Config(signature_version="v4"),
+    }
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    if settings.s3_access_key_id and settings.s3_secret_access_key:
+        kwargs["aws_access_key_id"] = settings.s3_access_key_id
+        kwargs["aws_secret_access_key"] = settings.s3_secret_access_key
+    return boto3.client("sqs", **kwargs)
 
 
 def _wait_for_queue(client: Any) -> str:
@@ -55,7 +58,11 @@ def run() -> None:
     settings = get_settings()
     client = _sqs_client()
     queue_url = _wait_for_queue(client)
-    LOGGER.info("Ingestion worker is listening on %s", settings.sqs_queue_name)
+    LOGGER.info(
+        "Ingestion worker is listening on %s via %s",
+        settings.sqs_queue_name,
+        settings.s3_internal_endpoint_url.strip() or "AWS",
+    )
 
     while not STOP_EVENT.is_set():
         try:
