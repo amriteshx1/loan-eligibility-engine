@@ -835,6 +835,26 @@ if (run.status !== 'completed') {
 return [{ json: summary }];
 """.strip()
 
+HANDOFF_JS = r"""
+const summary = $('Optimization summary').first().json;
+const response = $json || {};
+let notificationError = null;
+if (response.error) {
+  const details = response.error;
+  notificationError = typeof details === 'string'
+    ? details
+    : (details.message || details.description || 'User notification did not finish');
+}
+return [{
+  json: {
+    ...summary,
+    notification_triggered: !notificationError,
+    notification_error: notificationError,
+    notification: notificationError ? null : response,
+  },
+}];
+""".strip()
+
 UPSERT_REPLACEMENT = (
     "={{ [$json.batch_id, $json.run_started, JSON.stringify($json.matches || []), "
     "$json.page_context.users_in_page, $json.page_context.sql_candidates, "
@@ -1043,6 +1063,27 @@ def main():
             "={{ [$('Sum optimization counts').first().json.batch_id, $('Sum optimization counts').first().json.status, $('Sum optimization counts').first().json.users_in_batch, $('Sum optimization counts').first().json.active_products, $('Sum optimization counts').first().json.theoretical_pairs, $('Sum optimization counts').first().json.sql_candidates, $('Sum optimization counts').first().json.deterministic_remaining, $('Sum optimization counts').first().json.qualitative_pairs, $('Sum optimization counts').first().json.qualitative_llm_pairs, $('Sum optimization counts').first().json.llm_calls, $('Sum optimization counts').first().json.llm_errors, $('Sum optimization counts').first().json.matches_written, $json.stale_matches_removed, $('Sum optimization counts').first().json.pages_processed, $('Sum optimization counts').first().json.products_skipped_currency] }}",
         ),
         code_node("Optimization summary", "b4e0a001-0000-4000-8000-00000000001b", [2340, 460], SUMMARY_JS),
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "http://127.0.0.1:5678/webhook/user-notification",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendBody": True,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({ batch_id: $json.batch_id }) }}",
+                "options": {"timeout": 180000},
+            },
+            "id": "b4e0a001-0000-4000-8000-00000000001c",
+            "name": "Start user notification",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.5,
+            "position": [2600, 460],
+            "continueOnFail": True,
+            "notes": "Hands the completed batch_id to Workflow C. Matching rows are already saved.",
+            "notesInFlow": True,
+        },
+        code_node("Notification handoff", "b4e0a001-0000-4000-8000-00000000001d", [2860, 460], HANDOFF_JS),
     ]
     link = lambda target: {"node": target, "type": "main", "index": 0}
     connections = {
@@ -1065,6 +1106,8 @@ def main():
         "Sum optimization counts": {"main": [[link("Remove stale matches")]]},
         "Remove stale matches": {"main": [[link("Record optimization run")]]},
         "Record optimization run": {"main": [[link("Optimization summary")]]},
+        "Optimization summary": {"main": [[link("Start user notification")]]},
+        "Start user notification": {"main": [[link("Notification handoff")]]},
     }
     workflow = {
         "name": "Workflow B - User Loan Matching",
