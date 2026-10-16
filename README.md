@@ -3,17 +3,22 @@
 Event-driven personal-loan eligibility pipeline built for the engineering
 intern assignment in this repository.
 
-This branch currently implements **Phase 1 and Phase 2 only**:
+This branch implements **Phases 1–4**:
 
 - a local PostgreSQL database with the application schema;
 - self-hosted n8n in Docker;
 - local AWS-compatible S3 and SQS through LocalStack;
 - a Python upload/ingestion service;
 - a minimal CSV upload UI;
-- direct-to-object-storage uploads and asynchronous CSV ingestion.
+- direct-to-object-storage uploads and asynchronous CSV ingestion;
+- a scheduled n8n loan-product discovery workflow that compiles public lender
+  pages into normalized eligibility profiles and upserts them into PostgreSQL;
+- an n8n matching workflow that reduces each completed batch in PostgreSQL,
+  applies deterministic rules, and calls Gemini only for qualitative criteria
+  the CSV can actually support.
 
-Loan discovery, matching, LLM use, and notification workflows are intentionally
-not implemented yet. AWS deployment is also deferred.
+Notifications (Workflow C) and AWS deployment are intentionally not implemented
+yet.
 
 ## Local architecture
 
@@ -26,7 +31,14 @@ flowchart LR
     S3 -->|object-created event| Queue[LocalStack SQS]
     Queue --> Worker[Python ingestion worker]
     Worker -->|stream parse and COPY| Db
-    Worker -.->|batch_id after success, later phase| N8n[n8n Workflow B]
+    Worker -->|batch_id and shared secret| Match[Workflow B: matching]
+    Match -->|indexed numeric filters and paged reads| Db
+    Match -.->|only checkable qualitative wording| Gemini[Gemini structured check]
+    Match -->|idempotent match upsert| Db
+    Schedule[Daily n8n schedule] --> Discovery[Workflow A: product discovery]
+    Discovery --> Lenders[Public lender product pages]
+    Discovery -.->|only for unresolved source text| LLM[Structured LLM fallback]
+    Discovery --> Db
 ```
 
 This uses the same S3 and SQS API boundaries intended for AWS. The upload
@@ -54,7 +66,9 @@ No local Python or PostgreSQL installation is required.
 
 1. Copy `.env.example` to `.env`.
 2. Replace `POSTGRES_SUPERUSER_PASSWORD` and `N8N_ENCRYPTION_KEY` in `.env`.
-3. Leave `N8N_MATCH_WEBHOOK_URL` empty until Workflow B is implemented.
+3. Set `N8N_WEBHOOK_SECRET` and `GEMINI_API_KEY` in `.env`. The webhook URL
+   should be `http://n8n:5678/webhook/user-loan-matching`. Do not commit `.env`
+   or paste the Gemini key into a workflow, log, or this README.
 4. Start the services:
 
    ```bash
@@ -113,31 +127,317 @@ needed.
 
 - `ingestion_batches` for object/event correlation and processing state;
 - `users` for validated user data;
-- `loan_products` for the later discovery workflow;
-- `matches` for the later matching and notification workflows.
+- `loan_products` for normalized discovered products;
+- `matches` for eligibility results and, later, notification state;
+- `matching_runs` for one optimization record per Workflow B execution.
 
 The ingestion callback is idempotent: only a `pending` batch can be claimed,
 and users are unique by `(batch_id, user_id)`.
 
+Workflow A adds `income_currency` (the selected sources are USD) and
+`source_evidence`. It also changes the default `qualitative_criteria` value
+to a JSON array. The matcher reads that array and does not treat a missing
+criterion as a rejection.
+The schema file contains additive `ALTER TABLE ... IF NOT EXISTS` statements,
+so running it updates an already-initialized local database without dropping
+products.
+
+## Workflow A — Loan Product Discovery
+
+[`n8n/workflows/loan-product-discovery.json`](n8n/workflows/loan-product-discovery.json)
+is an importable, inactive-by-default n8n export. It has both a daily Schedule
+Trigger (06:15 Asia/Kolkata) and a Manual Trigger for demonstrations:
+
+```text
+Schedule / Manual
+  -> source configuration (3 deliberately small source records)
+  -> HTTP GET with retry
+  -> HTML cleanup + deterministic extraction
+  -> LLM fallback only for an explicitly unresolved configured source
+  -> schema/range validation and employment normalization
+  -> PostgreSQL parameterized upsert
+  -> per-source outcomes -> execution summary
+  -> deactivate products removed from the configured source list
+```
+
+The chosen pages were checked from inside the n8n container, not just in a
+desktop browser. All returned HTTP 200 and expose useful server-rendered text:
+
+| Source/product | Public page | Why it was selected |
+| --- | --- | --- |
+| Discover Personal Loan | [Discover](https://www.discover.com/personal-loans/) | States age 18+, $25,000 minimum individual/household annual income, and an APR range on its product page. |
+| LendingPoint Personal Loan | [LendingPoint](https://www.lendingpoint.com/) | States age 18+, $35,000 minimum annual income, $7.99–$35.99 APR, and clear identity/banking/residency requirements. |
+| Upgrade Personal Loan | [Upgrade](https://www.upgrade.com/personal-loans/) | States age 18+, 7.74%–35.99% APR, and clear residency/bank/email requirements; it purposefully publishes no fixed income or credit-score cutoff. |
+
+This workflow is a small curated discovery set, not a general web crawler.
+Adding a lender means first confirming that its HTML is publicly reachable from
+the n8n container and then adding a reviewed source record and deterministic
+pattern. That is intentional: it makes the workflow reliable and demoable
+without browser automation or a separate crawler service.
+
+### Deterministic extraction before LLM
+
+The extraction node removes scripts, styles, markup, and excess whitespace. It
+then extracts only explicit rate ranges, annual-income thresholds, and age
+thresholds. Age is accepted as “at least 18 years old,” “at least 18 years of
+age,” or “18 years or older,” which covers the wording used by the selected
+lenders. Explicit annual income is converted to monthly income with
+two-decimal precision. The node records the matching source snippets alongside
+the normalized values.
+
+The three selected pages do not require an LLM in their current form, so their
+`allow_llm_fallback` configuration is `false`; a normal execution makes zero
+LLM calls. This is by design, not a missing path. The fallback branch is
+present for a future reviewed source whose eligibility wording cannot be
+normalized safely with deterministic extraction. It runs only when that source
+explicitly enables the fallback and the cleaned page still contains eligibility
+language that produced no qualitative criteria:
+
+- It passes only selected, cleaned eligibility/product excerpts (capped at
+  6,000 characters), never the whole HTML page.
+- It requests strict JSON Schema output and directs the model to return
+  `null` for absent or ambiguous values.
+- A downstream node rejects malformed JSON, bad arrays, non-numeric values,
+  invalid ranges, and missing stable identity before the database node runs.
+- Deterministically extracted values take precedence; the fallback may fill
+  only a currently unknown field.
+
+The fallback is written for OpenAI's Chat Completions Structured Outputs. Create
+an n8n **Header Auth** credential with header name `Authorization` and value
+`Bearer YOUR_OPENAI_API_KEY`, then attach it to **LLM structured extraction**
+before enabling `allow_llm_fallback` on a reviewed source. The workflow export
+contains no key. OpenAI's [Structured Outputs documentation](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses)
+explains the strict JSON-schema response mode used by the fallback.
+
+### Normalized profile and unknowns
+
+Each valid source becomes one `loan_products` row with the following matching
+shape:
+
+```json
+{
+  "product_name": "LendingPoint Personal Loan",
+  "interest_rate_min": 7.99,
+  "interest_rate_max": 35.99,
+  "minimum_monthly_income": 2916.67,
+  "income_currency": "USD",
+  "credit_score_min": null,
+  "credit_score_max": null,
+  "age_min": 18,
+  "age_max": null,
+  "accepted_employment_statuses": null,
+  "qualitative_criteria": [
+    "Government-issued photo ID required",
+    "Verifiable personal bank account required"
+  ]
+}
+```
+
+`NULL` means *unknown/not stated*, not a failed requirement. For example,
+Workflow A does not invent a credit-score cutoff for any chosen lender,
+does not fabricate an age maximum, and leaves
+`accepted_employment_statuses` as `NULL` unless a source explicitly names
+accepted categories. A lender's generic statement that it considers credit,
+income, or employment is saved as qualitative text rather than falsely turned
+into a hard numeric rule. `source_evidence` is a compact JSON array of
+`{field, snippet}` objects to make the stored facts explainable; it is not a
+separate audit system.
+
+The initial source set is U.S./USD only. Phase 4 should treat the existing
+`users.monthly_income` field as USD when it compares it to these products.
+It must not compare a different-currency upload without an explicit currency
+contract or conversion step.
+
+### Upsert, errors, and summary
+
+The upsert's stable identity is
+`(source_name, source_url, product_name)`, the existing unique key. On every
+successful sighting it overwrites extracted eligibility fields/evidence, sets
+`active = true`, and advances `last_seen_at`; it never inserts a duplicate
+for the same source product. Array fields are sent as JSON text so PostgreSQL
+receives valid `jsonb` values. After the crawl, any stored product whose
+identity is no longer in the configured source list is marked `active = false`.
+A source that fails during the current run stays active with its last
+successful profile and its previous `last_seen_at`.
+
+HTTP requests retry once. Bad responses, unexpected/empty HTML, malformed LLM
+responses, validation errors, and database errors become a visible per-source
+failure outcome and are not persisted. One bad source therefore does not
+discard successful products from the other sources. The final node returns
+execution-only information in this shape:
+
+```json
+{
+  "sources_processed": 3,
+  "products_extracted": 3,
+  "products_upserted": 3,
+  "llm_extractions": 0,
+  "extraction_failures": 0,
+  "failures": [],
+  "products_deactivated": 0
+}
+```
+
+## Import and run Workflow A locally
+
+1. Start the stack with `docker compose up --build` and open
+   <http://localhost:5678>.
+2. Import
+   [`n8n/workflows/loan-product-discovery.json`](n8n/workflows/loan-product-discovery.json).
+3. Create a PostgreSQL credential in n8n using host `postgres`, port
+   `5432`, database `loan_engine`, user `loan_app`, password
+   `local-app-password`, and SSL disabled. Attach it to
+   **PostgreSQL upsert loan product**.
+4. Execute with **Manual trigger**. The final summary should report three
+   upserts and zero LLM calls. Query `loan_products` and confirm one row per
+   source. Run it again and confirm the row count stays at three while
+   `last_seen_at` advances.
+5. Configure the optional Header Auth credential only if a reviewed source is
+   explicitly enabled for the LLM fallback.
+6. Publish the workflow after the manual run succeeds. Publishing arms the
+   daily 06:15 Asia/Kolkata schedule. Import leaves the workflow inactive so
+   a source change can be inspected before that schedule starts.
+
+## Workflow B — user and loan matching
+
+[`n8n/workflows/user-loan-matching.json`](n8n/workflows/user-loan-matching.json)
+starts when ingestion finishes. The worker POSTs `{ "batch_id": "..." }` to
+`http://n8n:5678/webhook/user-loan-matching` with header `X-Webhook-Secret`.
+n8n checks that header before the workflow runs. The workflow then accepts only
+a completed batch and pages that batch by user id. It does not load every user
+or every product into n8n.
+
+The page size is 150 users. PostgreSQL builds the page boundaries, and each
+loop iteration reads only that id range.
+
+```text
+Webhook
+  -> validate batch_id and completed status
+  -> keyset page list
+  -> for each page:
+       SQL numeric candidate join
+       -> deterministic employment and qualitative classification
+       -> Gemini only for employment wording the CSV can answer
+       -> upsert matches
+  -> delete unnotified matches this run no longer supports
+  -> write matching_runs and the optimization summary
+```
+
+### Stage 1 — PostgreSQL
+
+The candidate query joins one page of users to active products and applies only
+hard numeric limits: minimum monthly income, credit-score minimum and maximum,
+and age minimum and maximum. A null product limit is unknown, so it does not
+reject the user. Income is compared only when the product currency is USD,
+which matches this CSV contract. A non-USD product that states an income floor
+is counted as skipped and is not treated as eligible.
+
+The join runs inside PostgreSQL. n8n receives one row per page, containing the
+surviving candidates, not the full user×product matrix.
+
+### Stage 2 — deterministic rules
+
+Employment uses three-valued logic. A null or empty accepted-status list is
+`UNKNOWN`, not a pass. A recognized status outside that list is `FAIL` and the
+pair stops. An unrecognized status stays `UNKNOWN` rather than being invented
+into a pass.
+
+Qualitative sentences are classified the same way:
+
+- SSN, address, residency, citizenship, visa, photo id, bank account, credit
+  usage, and payment history are `UNKNOWN` because the CSV has no such fields.
+  They are not sent to a model.
+- An email-only requirement can pass from the email column. A sentence that
+  also requires a device or online finalization stays `UNKNOWN`.
+- Employment wording that is not already decided by a structured status list
+  is the only qualitative input eligible for the model.
+
+A numeric rule is never delegated to the model.
+
+### Stage 3 — Gemini
+
+The model is `gemini-2.5-flash` through Google's `generateContent` API, with
+`temperature` 0 and a JSON schema of `PASS`, `FAIL`, or `UNKNOWN`. One request
+covers up to 25 criteria, grouped by user, not one call per pair. The response
+is accepted only when `check_id`, user id, and product id match the request.
+A `PASS` that depends on a missing attribute is downgraded to `UNKNOWN`. A
+`FAIL` that tries to re-apply income, credit, or age is ignored. If the call
+fails, those criteria stay `UNKNOWN` and the numeric result is unchanged.
+
+Create an n8n **Header Auth** credential named `Gemini API Key` with header
+name `x-goog-api-key`. Put the key in `.env` as `GEMINI_API_KEY` and in that
+credential. The workflow export does not contain it.
+
+### Match decision
+
+A match is written when the pair survived every numeric and deterministic
+`FAIL` and the model did not return a `FAIL`. `UNKNOWN` does not become a
+pass, and it does not by itself reject a pair whose supplied fields already
+passed. `match_reason` says the result is likely eligibility from the CSV, not
+a lender approval, lists the numeric checks that passed, and names the lender
+requirements the CSV cannot verify.
+
+`match_method` is `deterministic` or `deterministic+llm`. Re-running the
+webhook upserts the same `(user_record_id, product_id)` row and then removes
+unnotified rows from that batch that this run did not refresh. Notified rows
+are left alone for the later email phase. A failed page does not delete
+existing matches, so a retry can run the batch again.
+
+### Optimization record
+
+Each run inserts one `matching_runs` row and shows the same counts on the last
+node:
+
+| Count | Meaning |
+| --- | --- |
+| `users_in_batch` | Users in the completed batch |
+| `theoretical_pairs` | Users × active products, the size of a naive cross join |
+| `sql_candidates` | Pairs left after numeric SQL |
+| `deterministic_remaining` | Pairs left after deterministic failures |
+| `qualitative_pairs` | Remaining pairs whose product has qualitative wording |
+| `qualitative_llm_pairs` | Pairs whose wording is actually checkable |
+| `llm_calls` | Gemini requests |
+| `matches_written` | Eligible pairs upserted |
+
+For the current Discover, LendingPoint, and Upgrade profiles, qualitative
+requirements such as SSN, residency, and bank accounts are `UNKNOWN` without a
+model call. A normal batch therefore records `llm_calls = 0`.
+
+### Wire the webhook
+
+1. Import the workflow JSON. Import leaves it inactive.
+2. Attach **Loan Engine Postgres** to every Postgres node.
+3. Create Header Auth credential `Match Webhook Secret` with name
+   `X-Webhook-Secret` and the same value as `N8N_WEBHOOK_SECRET`. Attach it to
+   **Ingestion webhook**.
+4. Attach `Gemini API Key` to **Gemini qualitative check**.
+5. Publish the workflow and restart n8n so the production webhook is
+   registered.
+6. Recreate the backend and ingestion worker so they receive
+   `N8N_MATCH_WEBHOOK_URL` and `N8N_WEBHOOK_SECRET`.
+
+On an existing database, apply the additive schema before publishing:
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec -T postgres psql -U postgres -d loan_engine -f /opt/loan-engine/schema.sql
+```
+
+Git Bash on Windows rewrites that container path unless `MSYS_NO_PATHCONV=1` is set.
+
 ## n8n boundary
 
-n8n is running and persists its own state in PostgreSQL, but no workflow JSON
-is created in these phases. When Workflow B is implemented, set
-`N8N_MATCH_WEBHOOK_URL` and `N8N_WEBHOOK_SECRET`. After a successful database
-commit, the backend sends only the `batch_id` and the secret header to that
-webhook. A failed webhook does not roll back successfully ingested users; its
-error is recorded on the ingestion batch.
-
-LLM and AWS SES credentials are not needed in Phases 1–2. They will be stored
-in n8n's credential store when the workflows that use them are implemented,
-not in source files or exported workflow JSON.
+Workflow A owns product discovery. Workflow B owns eligibility matching.
+Python remains limited to CSV upload, ingestion, and the webhook handoff of a
+completed `batch_id`. Workflow B does not send email and does not start
+Workflow C.
 
 ## Current phase boundary
 
 The following assignment work remains intentionally untouched:
 
-1. Workflow A: scheduled public-site loan product discovery.
-2. Workflow B: optimized SQL/rules/LLM eligibility matching.
-3. Workflow C: AWS SES notifications to controlled test aliases.
-4. Workflow JSON exports, complete assignment documentation, demonstration
-   video, and final AWS/Serverless deployment artifacts.
+1. Workflow C: AWS SES notifications to controlled test aliases.
+2. AWS/Serverless deployment and unrelated delivery work.
+
+User income is treated as USD because the CSV has no currency column and the
+selected products are USD. A product priced in another currency, with an income
+floor, is skipped instead of converted or guessed.
