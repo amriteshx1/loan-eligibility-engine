@@ -381,6 +381,45 @@
         2340,
         460
       ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:5678/webhook/user-notification",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch_id: $json.batch_id }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "b4e0a001-0000-4000-8000-00000000001c",
+      "name": "Start user notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2600,
+        460
+      ],
+      "continueOnFail": true,
+      "notes": "Hands the completed batch_id to Workflow C. Matching rows are already saved.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const summary = $('Optimization summary').first().json;\nconst response = $json || {};\nlet notificationError = null;\nif (response.error) {\n  const details = response.error;\n  notificationError = typeof details === 'string'\n    ? details\n    : (details.message || details.description || 'User notification did not finish');\n}\nreturn [{\n  json: {\n    ...summary,\n    notification_triggered: !notificationError,\n    notification_error: notificationError,\n    notification: notificationError ? null : response,\n  },\n}];"
+      },
+      "id": "b4e0a001-0000-4000-8000-00000000001d",
+      "name": "Notification handoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        460
+      ]
     }
   ],
   "pinData": {},
@@ -609,6 +648,28 @@
         [
           {
             "node": "Optimization summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Optimization summary": {
+      "main": [
+        [
+          {
+            "node": "Start user notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start user notification": {
+      "main": [
+        [
+          {
+            "node": "Notification handoff",
             "type": "main",
             "index": 0
           }
