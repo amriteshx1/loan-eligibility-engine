@@ -1,0 +1,13 @@
+{
+  "name": "loan-eligibility-engine",
+  "private": true,
+  "description": "Packages the existing Python service for API Gateway and Lambda.",
+  "scripts": {
+    "deploy": "serverless deploy",
+    "remove": "serverless remove"
+  },
+  "devDependencies": {
+    "serverless": "^3.40.0",
+    "serverless-python-requirements": "^6.1.2"
+  }
+}
