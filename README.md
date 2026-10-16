@@ -3,7 +3,7 @@
 Event-driven personal-loan eligibility pipeline built for the engineering
 intern assignment in this repository.
 
-This branch implements **Phases 1–4**:
+This branch implements **Phases 1–5**:
 
 - a local PostgreSQL database with the application schema;
 - self-hosted n8n in Docker;
@@ -15,10 +15,11 @@ This branch implements **Phases 1–4**:
   pages into normalized eligibility profiles and upserts them into PostgreSQL;
 - an n8n matching workflow that reduces each completed batch in PostgreSQL,
   applies deterministic rules, and calls Gemini only for qualitative criteria
-  the CSV can actually support.
+  the CSV can actually support;
+- an n8n notification workflow that sends one AWS SES email per user to a
+  Gmail plus alias and records `notified_at` only after SES accepts the send.
 
-Notifications (Workflow C) and AWS deployment are intentionally not implemented
-yet.
+AWS deployment is intentionally not implemented yet.
 
 ## Local architecture
 
@@ -35,6 +36,9 @@ flowchart LR
     Match -->|indexed numeric filters and paged reads| Db
     Match -.->|only checkable qualitative wording| Gemini[Gemini structured check]
     Match -->|idempotent match upsert| Db
+    Match -->|completed batch_id| Notify[Workflow C: notification]
+    Notify -->|one email per user| Ses[AWS SES]
+    Ses --> Alias[Gmail plus aliases]
     Schedule[Daily n8n schedule] --> Discovery[Workflow A: product discovery]
     Discovery --> Lenders[Public lender product pages]
     Discovery -.->|only for unresolved source text| LLM[Structured LLM fallback]
@@ -66,9 +70,10 @@ No local Python or PostgreSQL installation is required.
 
 1. Copy `.env.example` to `.env`.
 2. Replace `POSTGRES_SUPERUSER_PASSWORD` and `N8N_ENCRYPTION_KEY` in `.env`.
-3. Set `N8N_WEBHOOK_SECRET` and `GEMINI_API_KEY` in `.env`. The webhook URL
-   should be `http://n8n:5678/webhook/user-loan-matching`. Do not commit `.env`
-   or paste the Gemini key into a workflow, log, or this README.
+3. Set `N8N_WEBHOOK_SECRET`, `GEMINI_API_KEY`, and
+   `NOTIFICATION_TEST_EMAIL_BASE` in `.env`. The matching webhook URL should be
+   `http://n8n:5678/webhook/user-loan-matching`. Do not commit `.env` or paste
+   the Gemini key into a workflow, log, or this README.
 4. Start the services:
 
    ```bash
@@ -128,7 +133,7 @@ needed.
 - `ingestion_batches` for object/event correlation and processing state;
 - `users` for validated user data;
 - `loan_products` for normalized discovered products;
-- `matches` for eligibility results and, later, notification state;
+- `matches` for eligibility results and notification state;
 - `matching_runs` for one optimization record per Workflow B execution.
 
 The ingestion callback is idempotent: only a `pending` batch can be claimed,
@@ -424,19 +429,78 @@ MSYS_NO_PATHCONV=1 docker compose exec -T postgres psql -U postgres -d loan_engi
 
 Git Bash on Windows rewrites that container path unless `MSYS_NO_PATHCONV=1` is set.
 
+## Workflow C — user notification
+
+[`n8n/workflows/user-notification.json`](n8n/workflows/user-notification.json)
+runs after Workflow B finishes a completed batch. The last matching nodes POST
+`{ "batch_id": "..." }` to `http://127.0.0.1:5678/webhook/user-notification`
+with the same `X-Webhook-Secret` header. Matching does not build or send the
+email. If that call fails, the match rows stay saved and Workflow C can be
+started again with the same `batch_id`.
+
+```text
+Webhook
+  -> completed batch only
+  -> unnotified matches for that batch, grouped by user
+  -> one HTML email per user
+  -> AWS SES
+  -> set notified_at only when SES returns a MessageId
+```
+
+The query reads `matches` where `notified_at IS NULL`, joined to `users` and
+`loan_products`. It does not select `users.email`. A user with several new
+matches gets one email listing every one of those products: product name,
+interest-rate range, and the stored match reason. The message says the result
+is likely eligibility from the supplied data and is not a guaranteed approval
+or a lender decision.
+
+`NOTIFICATION_TEST_EMAIL_BASE` is the Gmail address you control, without a plus
+tag. The recipient is always `<local>+loan-<user_id>@gmail.com`. `SES_FROM_EMAIL`
+is the verified SES sender; when it is empty, the workflow uses the Gmail base.
+Set both in `.env` and recreate the n8n container so the process can read them.
+The workflow stops before SES if either address is missing or looks like a
+sample CSV address.
+
+### AWS SES credential
+
+In n8n, create an **AWS** credential named `AWS SES`, or replace the keys on
+the credential already named that, with an IAM user that can call
+`ses:SendEmail`. Use region `us-east-1` and no custom endpoint. Attach it to
+**Send match email**. Attach **Loan Engine Postgres** to both Postgres nodes
+and **Match Webhook Secret** to **Notification webhook**. Attach that same
+header credential to Workflow B's **Start user notification** node.
+
+SES sandbox accounts can send only to verified identities. Verifying the base
+Gmail address does not verify `base+loan-...@gmail.com`. Verify each alias, or
+move the account out of the sandbox, before the demonstration. A failed SES
+call does not set `notified_at`. Run the webhook again after fixing the cause;
+already notified matches are not sent again.
+
+### Run it for a completed batch
+
+Publish Workflow C before publishing the matching handoff, then restart n8n so
+both production webhooks are registered.
+
+```bash
+curl -sS -X POST http://localhost:5678/webhook/user-notification \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: $N8N_WEBHOOK_SECRET" \
+  -d '{"batch_id":"<completed-batch-uuid>"}'
+```
+
+A finished run reports `emails_sent`, the alias for each user, and the product
+names in that email. `matches.notified_at` is set only for those rows.
+
 ## n8n boundary
 
 Workflow A owns product discovery. Workflow B owns eligibility matching.
-Python remains limited to CSV upload, ingestion, and the webhook handoff of a
-completed `batch_id`. Workflow B does not send email and does not start
-Workflow C.
+Workflow C owns notification. Python remains limited to CSV upload, ingestion,
+and the webhook handoff of a completed `batch_id`.
 
 ## Current phase boundary
 
-The following assignment work remains intentionally untouched:
-
-1. Workflow C: AWS SES notifications to controlled test aliases.
-2. AWS/Serverless deployment and unrelated delivery work.
+AWS/Serverless deployment, the private GitHub submission, and the
+demonstration video remain intentionally untouched.
 
 User income is treated as USD because the CSV has no currency column and the
 selected products are USD. A product priced in another currency, with an income
