@@ -1,0 +1,432 @@
+# AWS shape of the local pipeline.
+# API Gateway serves the existing FastAPI app. The browser uploads the CSV
+# directly to S3. S3 notifies SQS, and a second Lambda calls the same
+# ingestion functions as the local worker. n8n and SES stay outside this stack.
+service: loan-eligibility-engine
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: x86_64
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 512
+  timeout: 29
+  logRetentionInDays: 14
+  environment:
+    S3_BUCKET: ${self:custom.bucketName}
+    S3_REGION: ${aws:region}
+    SQS_QUEUE_NAME: ${self:custom.queueName}
+    PRESIGNED_URL_EXPIRY_SECONDS: "900"
+    DB_HOST:
+      Fn::GetAtt:
+        - Database
+        - Endpoint.Address
+    DB_PORT:
+      Fn::GetAtt:
+        - Database
+        - Endpoint.Port
+    DB_NAME: loan_engine
+    DB_USER: loan_app
+    DB_SSLMODE: require
+    DB_PASSWORD:
+      Fn::Join:
+        - ""
+        - - "{{resolve:secretsmanager:"
+          - Ref: DatabaseSecret
+          - ":SecretString:password}}"
+    N8N_MATCH_WEBHOOK_URL: ${env:N8N_MATCH_WEBHOOK_URL, ''}
+    N8N_WEBHOOK_SECRET: ${env:N8N_WEBHOOK_SECRET, ''}
+  vpc:
+    securityGroupIds:
+      - Ref: LambdaSecurityGroup
+    subnetIds:
+      - Ref: PrivateSubnetA
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+          Resource:
+            - arn:aws:s3:::${self:custom.bucketName}/uploads/*
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::${self:custom.bucketName}/uploads/*
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ChangeMessageVisibility
+          Resource:
+            - arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.queueName}
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  patterns:
+    - "!node_modules/**"
+    - "!.git/**"
+    - "!.serverless/**"
+    - "!.cursor/**"
+    - "!n8n/**"
+    - "!tmp-phase5/**"
+    - "!.env"
+    - "!.env.*"
+    - "!**/*.md"
+
+custom:
+  bucketName: ${self:service}-${sls:stage}-${aws:accountId}
+  queueName: ${self:service}-${sls:stage}-uploads
+  pythonRequirements:
+    dockerizePip: non-linux
+    dockerImage: public.ecr.aws/sam/build-python3.12:latest
+    slim: false
+    useStaticCache: true
+    useDownloadCache: true
+
+functions:
+  api:
+    handler: backend.app.aws_api.handler
+    description: Upload UI and presigned CSV upload session
+    timeout: 29
+    memorySize: 512
+    dependsOn:
+      - PrivateDefaultRoute
+    events:
+      - httpApi:
+          method: ANY
+          path: /
+      - httpApi:
+          method: ANY
+          path: /{proxy+}
+  ingest:
+    handler: backend.app.aws_ingest.handler
+    description: S3 object-created ingestion
+    timeout: 120
+    memorySize: 1024
+    dependsOn:
+      - PrivateDefaultRoute
+      - S3Endpoint
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - UploadQueue
+              - Arn
+          batchSize: 5
+          functionResponseType: ReportBatchItemFailures
+  schemaInit:
+    handler: backend.app.aws_schema.handler
+    description: Apply db/schema.sql to private RDS
+    timeout: 180
+    memorySize: 256
+    dependsOn:
+      - PrivateDefaultRoute
+
+resources:
+  Resources:
+    Vpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.42.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+    GatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref Vpc
+        InternetGatewayId: !Ref InternetGateway
+
+    PublicSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: ""
+        CidrBlock: 10.42.0.0/24
+        MapPublicIpOnLaunch: true
+
+    PublicSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: ""
+        CidrBlock: 10.42.1.0/24
+        MapPublicIpOnLaunch: true
+
+    PrivateSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: ""
+        CidrBlock: 10.42.10.0/24
+
+    PrivateSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: ""
+        CidrBlock: 10.42.11.0/24
+
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref Vpc
+
+    PublicDefaultRoute:
+      Type: AWS::EC2::Route
+      DependsOn: GatewayAttachment
+      Properties:
+        RouteTableId: !Ref PublicRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: !Ref InternetGateway
+
+    PublicSubnetARoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PublicSubnetA
+        RouteTableId: !Ref PublicRouteTable
+
+    PublicSubnetBRoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PublicSubnetB
+        RouteTableId: !Ref PublicRouteTable
+
+    NatEip:
+      Type: AWS::EC2::EIP
+      DependsOn: GatewayAttachment
+      Properties:
+        Domain: vpc
+
+    NatGateway:
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId: !GetAtt NatEip.AllocationId
+        SubnetId: !Ref PublicSubnetA
+
+    PrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref Vpc
+
+    PrivateDefaultRoute:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref PrivateRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId: !Ref NatGateway
+
+    PrivateSubnetARoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PrivateSubnetA
+        RouteTableId: !Ref PrivateRouteTable
+
+    PrivateSubnetBRoute:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PrivateSubnetB
+        RouteTableId: !Ref PrivateRouteTable
+
+    S3Endpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: !Ref Vpc
+        ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+        VpcEndpointType: Gateway
+        RouteTableIds:
+          - !Ref PrivateRouteTable
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Loan engine Lambda functions
+        VpcId: !Ref Vpc
+        SecurityGroupEgress:
+          - IpProtocol: "-1"
+            CidrIp: 0.0.0.0/0
+
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Loan engine PostgreSQL
+        VpcId: !Ref Vpc
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+    DatabaseSecret:
+      Type: AWS::SecretsManager::Secret
+      DeletionPolicy: Delete
+      Properties:
+        Name: !Sub ${AWS::StackName}-db
+        RecoveryWindowInDays: 0
+        GenerateSecretString:
+          SecretStringTemplate: '{"username":"loan_app"}'
+          GenerateStringKey: password
+          ExcludePunctuation: true
+          PasswordLength: 32
+
+    DatabaseSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Private subnets for the loan engine database
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${sls:stage}
+        Engine: postgres
+        EngineVersion: ${env:RDS_ENGINE_VERSION, '16.8'}
+        DBInstanceClass: ${env:RDS_INSTANCE_CLASS, 'db.t4g.micro'}
+        AllocatedStorage: "20"
+        StorageType: gp3
+        StorageEncrypted: true
+        MasterUsername: loan_app
+        MasterUserPassword:
+          Fn::Join:
+            - ""
+            - - "{{resolve:secretsmanager:"
+              - Ref: DatabaseSecret
+              - ":SecretString:password}}"
+        DBName: loan_engine
+        VPCSecurityGroups:
+          - !Ref DatabaseSecurityGroup
+        DBSubnetGroupName: !Ref DatabaseSubnetGroup
+        PubliclyAccessible: false
+        BackupRetentionPeriod: 1
+        MultiAZ: false
+        DeletionProtection: false
+
+    UploadDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.queueName}-dlq
+        MessageRetentionPeriod: 1209600
+
+    UploadQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.queueName}
+        VisibilityTimeout: 720
+        MessageRetentionPeriod: 1209600
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt UploadDeadLetterQueue.Arn
+          maxReceiveCount: 3
+
+    UploadQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref UploadQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: AllowUploadBucket
+              Effect: Allow
+              Principal:
+                Service: s3.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt UploadQueue.Arn
+              Condition:
+                ArnLike:
+                  aws:SourceArn: arn:aws:s3:::${self:custom.bucketName}
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: UploadQueuePolicy
+      Properties:
+        BucketName: ${self:custom.bucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ["*"]
+              AllowedMethods: [PUT, GET, HEAD]
+              AllowedOrigins: ["*"]
+              MaxAge: 3000
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:Put
+              Queue: !GetAtt UploadQueue.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: uploads/
+
+    LoanSchema:
+      Type: Custom::LoanSchema
+      DependsOn:
+        - PrivateDefaultRoute
+        - Database
+      Properties:
+        ServiceToken: !GetAtt SchemaInitLambdaFunction.Arn
+        DatabaseAddress: !GetAtt Database.Endpoint.Address
+
+    N8nSesSendPolicy:
+      Type: AWS::IAM::ManagedPolicy
+      Properties:
+        ManagedPolicyName: ${self:service}-${sls:stage}-n8n-ses
+        Description: Allows the self-hosted n8n SES node to send match email
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+
+  Outputs:
+    ApiUrl:
+      Description: Upload page and API
+      Value: !GetAtt HttpApi.ApiEndpoint
+    UploadBucketName:
+      Description: Private CSV bucket
+      Value: !Ref UploadBucket
+    UploadQueueUrl:
+      Description: Ingestion queue
+      Value: !Ref UploadQueue
+    DatabaseEndpoint:
+      Description: Private RDS endpoint
+      Value: !GetAtt Database.Endpoint.Address
+    DatabaseSecretArn:
+      Description: RDS password secret. The value is not printed.
+      Value: !Ref DatabaseSecret
+    N8nSesPolicyArn:
+      Description: Attach this policy to the IAM user used by the n8n SES credential
+      Value: !Ref N8nSesSendPolicy
