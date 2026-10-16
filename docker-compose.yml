@@ -107,6 +107,9 @@ services:
       N8N_PORT: 5678
       N8N_PROTOCOL: http
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-replace-with-a-long-random-local-key}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      NOTIFICATION_TEST_EMAIL_BASE: ${NOTIFICATION_TEST_EMAIL_BASE:-}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL:-}
       GENERIC_TIMEZONE: Asia/Kolkata
       TZ: Asia/Kolkata
     ports:
