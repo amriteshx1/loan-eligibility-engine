@@ -2,7 +2,7 @@
 # API Gateway serves the existing FastAPI app. The browser uploads the CSV
 # directly to S3. S3 notifies SQS, and a second Lambda calls the same
 # ingestion functions as the local worker. n8n and SES stay outside this stack.
-service: loan-eligibility-engine
+service: loan-eligibility-engine-final
 frameworkVersion: "3"
 
 provider:
@@ -84,6 +84,7 @@ custom:
   bucketName: ${self:service}-${sls:stage}-${aws:accountId}
   queueName: ${self:service}-${sls:stage}-uploads
   pythonRequirements:
+    fileName: backend/requirements.txt
     dockerizePip: non-linux
     dockerImage: public.ecr.aws/sam/build-python3.12:latest
     slim: false
@@ -284,7 +285,6 @@ resources:
       DeletionPolicy: Delete
       Properties:
         Name: !Sub ${AWS::StackName}-db
-        RecoveryWindowInDays: 0
         GenerateSecretString:
           SecretStringTemplate: '{"username":"loan_app"}'
           GenerateStringKey: password
@@ -305,7 +305,7 @@ resources:
       Properties:
         DBInstanceIdentifier: ${self:service}-${sls:stage}
         Engine: postgres
-        EngineVersion: ${env:RDS_ENGINE_VERSION, '16.8'}
+        EngineVersion: ${env:RDS_ENGINE_VERSION, '16.15'}
         DBInstanceClass: ${env:RDS_INSTANCE_CLASS, 'db.t4g.micro'}
         AllocatedStorage: "20"
         StorageType: gp3
