@@ -4,48 +4,137 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Loan Eligibility Engine</title>
-    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="stylesheet" href="/assets/styles.css?v=2" />
   </head>
   <body>
     <main class="shell">
       <section class="card" aria-labelledby="page-title">
-        <p class="eyebrow">Loan Eligibility Engine</p>
-        <h1 id="page-title">Upload user data</h1>
-        <p class="intro">
-          Select a UTF-8 CSV containing the required user fields. The file is
-          uploaded directly to object storage and processed asynchronously.
-        </p>
-
-        <form id="upload-form">
-          <label for="csv-file">User CSV</label>
-          <input id="csv-file" name="csv-file" type="file" accept=".csv,text/csv" required />
-          <p class="hint">
-            Required columns: user_id, email, monthly_income, credit_score,
-            employment_status, age
+        <header class="card-header">
+          <h1 id="page-title" class="card-title">Upload users</h1>
+          <p class="card-description">
+            Add applicants from a CSV. Each row is checked and saved, then matched to loan products.
           </p>
-          <button id="submit-button" type="submit">Upload CSV</button>
-        </form>
+        </header>
 
-        <div id="status-panel" class="status-panel" hidden aria-live="polite">
-          <div class="status-heading">
-            <span id="status-label">Preparing upload</span>
-            <span id="status-badge" class="badge">Pending</span>
+        <div class="card-content">
+          <form id="upload-form" novalidate>
+            <label class="dropzone" id="dropzone">
+              <input
+                id="csv-file"
+                class="file-input"
+                name="csv-file"
+                type="file"
+                accept=".csv,text/csv"
+              />
+              <span class="dropzone-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v12" />
+                  <path d="m17 8-5-5-5 5" />
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                </svg>
+              </span>
+              <span class="dropzone-copy">
+                <span id="drop-title" class="dropzone-title">Drop a CSV here</span>
+                <span id="drop-hint" class="dropzone-hint">or click to browse · UTF-8</span>
+              </span>
+            </label>
+            <p id="form-error" class="form-error" hidden></p>
+
+            <div class="fields">
+              <p class="fields-label">Required columns</p>
+              <ul class="badges">
+                <li class="badge badge-code">user_id</li>
+                <li class="badge badge-code">email</li>
+                <li class="badge badge-code">monthly_income</li>
+                <li class="badge badge-code">credit_score</li>
+                <li class="badge badge-code">employment_status</li>
+                <li class="badge badge-code">age</li>
+              </ul>
+            </div>
+
+            <button id="submit-button" class="button" type="submit">
+              <svg id="button-spinner" class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" hidden aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+              <span id="button-label">Upload CSV</span>
+            </button>
+          </form>
+
+          <div id="status-panel" class="status" hidden aria-live="polite">
+            <div class="status-head">
+              <p id="status-label">Getting an upload link</p>
+              <span id="status-badge" class="badge" data-tone="active">preparing</span>
+            </div>
+
+            <ol id="steps" class="steps">
+              <li data-step="prepare" data-state="pending">
+                <span class="step-mark" aria-hidden="true">
+                  <svg class="icon icon-pending" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8" /></svg>
+                  <svg class="icon icon-active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                  <svg class="icon icon-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5" /></svg>
+                  <svg class="icon icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                  <svg class="icon icon-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14" /></svg>
+                </span>
+                <div class="step-copy">
+                  <p class="step-title">Prepare</p>
+                  <p class="step-detail">Request an upload link</p>
+                </div>
+              </li>
+              <li data-step="upload" data-state="pending">
+                <span class="step-mark" aria-hidden="true">
+                  <svg class="icon icon-pending" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8" /></svg>
+                  <svg class="icon icon-active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                  <svg class="icon icon-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5" /></svg>
+                  <svg class="icon icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                  <svg class="icon icon-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14" /></svg>
+                </span>
+                <div class="step-copy">
+                  <p class="step-title">Upload</p>
+                  <p class="step-detail">Send the CSV</p>
+                </div>
+              </li>
+              <li data-step="process" data-state="pending">
+                <span class="step-mark" aria-hidden="true">
+                  <svg class="icon icon-pending" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8" /></svg>
+                  <svg class="icon icon-active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                  <svg class="icon icon-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5" /></svg>
+                  <svg class="icon icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                  <svg class="icon icon-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14" /></svg>
+                </span>
+                <div class="step-copy">
+                  <p class="step-title">Save</p>
+                  <p class="step-detail">Check each row and store users</p>
+                </div>
+              </li>
+              <li data-step="match" data-state="pending">
+                <span class="step-mark" aria-hidden="true">
+                  <svg class="icon icon-pending" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8" /></svg>
+                  <svg class="icon icon-active" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                  <svg class="icon icon-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5" /></svg>
+                  <svg class="icon icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                  <svg class="icon icon-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14" /></svg>
+                </span>
+                <div class="step-copy">
+                  <p class="step-title">Match</p>
+                  <p class="step-detail">Start loan matching for this batch</p>
+                </div>
+              </li>
+            </ol>
+
+            <dl id="batch-details" class="meta" hidden>
+              <div>
+                <dt>Users saved</dt>
+                <dd id="row-count">—</dd>
+              </div>
+              <div>
+                <dt>Batch</dt>
+                <dd id="batch-id"></dd>
+              </div>
+            </dl>
           </div>
-          <p id="status-message"></p>
-          <dl id="batch-details" hidden>
-            <div>
-              <dt>Batch ID</dt>
-              <dd id="batch-id"></dd>
-            </div>
-            <div>
-              <dt>Rows stored</dt>
-              <dd id="row-count">0</dd>
-            </div>
-          </dl>
         </div>
       </section>
     </main>
-    <script src="/assets/app.js" defer></script>
+    <script src="/assets/app.js?v=2" defer></script>
   </body>
 </html>
-
