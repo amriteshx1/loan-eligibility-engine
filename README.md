@@ -430,8 +430,9 @@ export N8N_WEBHOOK_SECRET="<same value as the n8n header credential>"
 npx serverless deploy
 ```
 
-If CloudFormation rejects the PostgreSQL engine version, set
-`RDS_ENGINE_VERSION` to a version returned by:
+The database default is PostgreSQL `16.15` on `db.t4g.micro`. `16.8` is not
+offered for that class. To use another available version, set
+`RDS_ENGINE_VERSION` from:
 
 ```bash
 aws rds describe-db-engine-versions \
