@@ -109,18 +109,10 @@ def _copy_users(batch_id: UUID, object_key: str) -> int:
         normalized_headers = [header.strip() for header in reader.fieldnames]
         if len(normalized_headers) != len(set(normalized_headers)):
             raise CsvValidationError("The CSV contains duplicate column names.")
-        if set(normalized_headers) != REQUIRED_COLUMNS:
-            missing = sorted(REQUIRED_COLUMNS - set(normalized_headers))
-            unexpected = sorted(set(normalized_headers) - REQUIRED_COLUMNS)
-            details = []
-            if missing:
-                details.append(f"missing: {', '.join(missing)}")
-            if unexpected:
-                details.append(f"unexpected: {', '.join(unexpected)}")
+        missing = sorted(REQUIRED_COLUMNS - set(normalized_headers))
+        if missing:
             raise CsvValidationError(
-                "CSV columns must exactly match the required schema"
-                + (f" ({'; '.join(details)})" if details else "")
-                + "."
+                "CSV is missing required columns: " + ", ".join(missing) + "."
             )
         reader.fieldnames = normalized_headers
 
