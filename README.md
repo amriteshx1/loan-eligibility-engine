@@ -33,9 +33,10 @@ flowchart LR
 
 Locally, Docker Compose runs PostgreSQL 17, LocalStack S3/SQS, the FastAPI
 upload service, a polling ingestion worker, and n8n. On AWS, `serverless.yml`
-maps that boundary to API Gateway, two Lambda functions, S3, SQS, and private
-RDS. The CSV never passes through the API. n8n stays self-hosted either way,
-and SES is called by the n8n AWS SES node.
+maps that boundary to API Gateway, an API Lambda, an ingestion Lambda, a
+schema-init Lambda, S3, SQS, and private RDS. The CSV never passes through the
+API. n8n stays self-hosted either way, and SES is called by the n8n AWS SES
+node.
 
 ## Repository
 
@@ -113,10 +114,14 @@ n8n stores its own data in the `n8n` database. Application tables live in
 | `matches` | One eligibility result per user and product. `notified_at` stays null until SES accepts the email. |
 | `matching_runs` | Counts that show how much work SQL, rules, and the model each did. |
 
-Required CSV columns are exactly `user_id`, `email`, `monthly_income`,
-`credit_score`, `employment_status`, and `age`. A null product limit means the
-source did not state that limit. It does not reject the user. `schema.sql` is
-additive, so applying it again does not drop products or matches.
+Required CSV columns are `user_id`, `email`, `monthly_income`,
+`credit_score`, `employment_status`, and `age`. Extra columns are ignored and
+are not stored. The official assignment sample includes a `name` column, and
+that file is accepted. A missing required column, a duplicate header, or a
+duplicate `user_id` inside one batch fails the batch. A null product limit
+means the source did not state that limit. It does not reject the user.
+`schema.sql` is additive, so applying it again does not drop products or
+matches.
 
 The local application password in Compose is `local-app-password`. The n8n
 database password is `local-n8n-password`. Both are local development values.
@@ -132,7 +137,7 @@ in the n8n UI and attach them yourself:
 | Loan Engine Postgres | Workflows A, B, and C | Host `postgres`, port `5432`, database `loan_engine`, user `loan_app`, password `local-app-password`, SSL off |
 | Match Webhook Secret | Workflow B ingestion webhook, Workflow B’s notification handoff, Workflow C webhook | Header auth, name `X-Webhook-Secret`, value equal to `N8N_WEBHOOK_SECRET` |
 | Gemini API Key | Workflow B qualitative check | Header auth, name `x-goog-api-key`, value from `GEMINI_API_KEY` |
-| AWS SES | Workflow C send node | AWS credential, region `us-east-1`, no custom endpoint. IAM user with `ses:SendEmail` |
+| AWS (IAM) account | Workflow C **Send match email** | AWS credential, no custom endpoint. Region is the SES region where the sender and plus-alias identities are verified. The working demonstration uses `us-west-2`. The CloudFormation stack stays in `us-east-1`. IAM user with `ses:SendEmail` and `ses:SendRawEmail` |
 
 The optional product-discovery fallback uses a Header Auth credential named
 for OpenAI: header `Authorization`, value `Bearer <key>`. Current sources
@@ -307,6 +312,13 @@ For Discover, LendingPoint, and Upgrade, residency, identity, and bank
 requirements stay `UNKNOWN` without a model call. A normal batch records
 `llm_calls = 0`.
 
+The official 10,000-row sample passes the numeric limits these three products
+state, and none of them publish an accepted employment list. Workflow B
+execution 34, batch `0f8c8bab-7bd5-43a7-bf5a-8b2e18b68a40`, therefore recorded
+10,000 users, 3 active products, 30,000 theoretical pairs, 30,000 SQL
+candidates, 30,000 deterministic pairs, 0 LLM calls, 30,000 matches, and 67
+pages. The stages still run. This file does not contain a row that fails them.
+
 ## Workflow C — user notification
 
 `n8n/workflows/user-notification.json` reads unnotified matches for the posted
@@ -343,10 +355,14 @@ successful rows have already been recorded, so a retry does not resend them.
 
 ### SES sandbox and aliases
 
-Create or update the n8n AWS credential used by **Send match email**. Region
-`us-east-1`. Custom endpoints off. The IAM user needs `ses:SendEmail` and
-`ses:SendRawEmail`. `serverless.yml` creates a managed policy for that, named
-`loan-eligibility-engine-<stage>-n8n-ses`, but it does not create access keys.
+Create or update the n8n AWS credential used by **Send match email**. The
+credential name in the working instance is **AWS (IAM) account**. Custom
+endpoints off. Set the credential region to the SES region that holds the
+verified identities. The working demonstration uses `us-west-2`. The IAM user
+needs `ses:SendEmail` and `ses:SendRawEmail`. `serverless.yml` creates a
+managed policy for that, named
+`loan-eligibility-engine-final-<stage>-n8n-ses`, and does not create access
+keys.
 
 In the SES sandbox, mail can go only to verified identities. Verifying
 `owner@gmail.com` does not verify `owner+loan-strong@gmail.com`. Verify the
@@ -384,14 +400,16 @@ young,young@example.com,5000,720,employed,17
 5. Open <http://localhost:8000>, upload the file, and wait until the page
    shows the batch completed. The browser PUTs the file to the presigned URL.
    The API response contains a batch id, not the CSV body.
-6. In n8n, open the matching execution. The optimization summary should show
-   a smaller candidate set than `theoretical_pairs`, and `llm_calls` should
-   be 0 for these sources. `young` fails the age-18 floor. `strong` and `low`
-   match only the products whose numeric floors they pass.
+6. In n8n, open the matching execution. For this three-row file the
+   optimization summary is `theoretical_pairs` 9, `sql_candidates` 4,
+   `deterministic_remaining` 4, `llm_calls` 0, and 4 matches. `young` fails
+   the age-18 floor on every product. `low` passes only Upgrade. `strong`
+   passes Discover, LendingPoint, and Upgrade.
 7. Open the notification execution started by the handoff. With a real SES
-   credential and verified aliases, each eligible user receives one email at
-   `...+loan-<user_id>@gmail.com`. `notified_at` is set only for those rows.
-   Post the same `batch_id` again and confirm no second email.
+   credential and verified aliases, `strong` and `low` each receive one email
+   at `...+loan-<user_id>@gmail.com`. `young` has no match and receives none.
+   `notified_at` is set only for the sent rows. Post the same `batch_id`
+   again and confirm no second email.
 
 Workflow A can also be left published so the 06:15 Asia/Kolkata schedule runs
 without a manual click.
@@ -444,8 +462,22 @@ aws rds describe-db-engine-versions \
 Deploy prints the API URL. Open it, upload a CSV, and confirm the batch
 reaches `completed` and n8n receives the `batch_id`. The schema custom
 resource applies `db/schema.sql` from inside the VPC. Attach the output SES
-policy to the IAM user whose keys you enter in n8n. Create those keys in the
-IAM console. The template does not create them.
+policy, `loan-eligibility-engine-final-<stage>-n8n-ses`, to the IAM user
+whose keys you enter in n8n. Create those keys in the IAM console. The
+template does not create them.
+
+Point the n8n **Loan Engine Postgres** credential at that same RDS instance:
+host from the database endpoint, port `5432`, database `loan_engine`, user
+`loan_app`, password from Secrets Manager secret `<stack-name>-db`. SSL is
+required. If n8n reports a certificate-chain error, enable **Ignore SSL
+Issues** on the credential. The template opens port 5432 only from the Lambda
+security group. The machine running n8n also needs that port allowed on the
+database security group, or Workflows A, B, and C cannot read the rows the
+Lambda wrote. Keep that address out of git.
+
+SES is separate from the stack region. Verify the sender and each
+`+loan-<user_id>` alias in the same SES region selected on the n8n credential.
+The working demonstration verifies them in `us-west-2`.
 
 Remove the stack when you are finished so the NAT gateway and database stop
 billing:
@@ -478,13 +510,24 @@ npx serverless remove
 
 ## Demonstration outline
 
-A 5–10 minute recording can follow this order:
+A 5–10 minute recording can follow this order. Publish Workflow C only for
+the small live email. A published Workflow C plus the 10,000-row sample sends
+one email per matched user.
 
-1. Show the diagram above and the Compose services.
-2. Open Workflow A, run it manually, and show three products with zero LLM
-   calls.
-3. Upload the sample CSV in the browser and show the batch row count.
-4. Open the matching summary and point at SQL candidates versus the
-   theoretical pair count, then the deterministic result and `llm_calls`.
-5. Show one received alias email and the `notified_at` values. Run the
-   notification webhook again and show that nothing is resent.
+1. Show the diagram above and the Compose services, or the deployed API URL.
+2. Open Workflow A, run it from **Manual trigger**, and show three products
+   with `llm_extractions: 0`. Execution 38 is a recorded success of that run.
+3. For scale, open Workflow B execution 34. The optimization summary is
+   10,000 users, 3 products, 30,000 theoretical pairs, 30,000 SQL candidates,
+   30,000 deterministic pairs, 0 LLM calls, 30,000 matches, and 67 pages of
+   150. The notification handoff on that run timed out. Do not retry it.
+4. For the live email, upload the three-row CSV when you want the age and
+   income floors to remove pairs. Upload a one-row file such as `demo001`
+   when you want a single recipient. That user, at income 5000 and age 30,
+   matches all three products, so the email lists three loans.
+5. Open the Workflow C execution. Show one SES `MessageId`, the Gmail message
+   at `...+loan-<user_id>@gmail.com`, and `notified_at` on that user’s match
+   rows. Post the same `batch_id` again and show `emails_sent: 0`. Execution
+   46 is the recorded one-user success: batch
+   `f10fad82-8194-43df-b892-700c3309c538`, one email to
+   `amriteshx18+loan-demo001@gmail.com`, three matches notified.
