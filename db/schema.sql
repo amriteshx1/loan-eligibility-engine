@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     batch_id UUID NOT NULL REFERENCES ingestion_batches(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
     email TEXT NOT NULL,
     monthly_income NUMERIC(14, 2) NOT NULL CHECK (monthly_income >= 0),
     credit_score INTEGER NOT NULL CHECK (credit_score >= 0 AND credit_score <= 1000),
@@ -24,6 +25,19 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (batch_id, user_id)
 );
+
+-- Existing databases created before name was required. New rows must carry a
+-- non-empty name. NOT VALID keeps a historical row that has no name from
+-- blocking this migration; ingestion rejects a blank name before insert.
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS name TEXT;
+
+ALTER TABLE users
+    DROP CONSTRAINT IF EXISTS users_name_required;
+
+ALTER TABLE users
+    ADD CONSTRAINT users_name_required
+    CHECK (name IS NOT NULL AND length(btrim(name)) > 0) NOT VALID;
 
 CREATE TABLE IF NOT EXISTS loan_products (
     id BIGSERIAL PRIMARY KEY,
