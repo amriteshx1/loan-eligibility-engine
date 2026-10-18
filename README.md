@@ -1,12 +1,15 @@
 # Loan Eligibility Engine
 
 Event-driven personal-loan eligibility pipeline. A browser uploads a user CSV
-directly to object storage. A worker loads that batch into PostgreSQL. n8n
-discovers public loan products, matches the batch, and sends one SES email per
-user to a Gmail plus alias.
+directly to object storage. A worker loads that batch into PostgreSQL. The
+matching service applies numeric limits in SQL and deterministic rules in
+Python, then asks n8n to judge only the qualitative cases it could not
+resolve. n8n discovers public loan products and sends one SES email per user
+to a Gmail plus alias.
 
-The same Python ingestion code runs locally, against LocalStack, and on AWS.
-n8n owns product discovery, matching, and notification.
+The same Python ingestion and matching code runs locally, against LocalStack,
+and on AWS. n8n owns product discovery, unresolved qualitative checks, and
+notification.
 
 ## Architecture
 
@@ -19,10 +22,12 @@ flowchart LR
     S3 -->|object created| Queue[SQS]
     Queue --> Ingest[Ingestion Lambda or worker]
     Ingest -->|stream and COPY| Db
-    Ingest -->|batch_id| Match[Workflow B]
-    Match -->|numeric SQL, then rules| Db
-    Match -.->|only checkable wording| Gemini[Gemini]
-    Match -->|batch_id| Notify[Workflow C]
+    Ingest -->|completed batch| Match[Matching Lambda or worker]
+    Match -->|set-based numeric SQL| Db
+    Match -->|resolved PASS or FAIL| Db
+    Match -->|unresolved qualitative cases| N8n[Workflow B]
+    N8n -.->|Gemini fallback only| Gemini[Gemini]
+    N8n -->|batch_id| Notify[Workflow C]
     Notify -->|one email per user| Ses[AWS SES]
     Ses --> Alias[Gmail plus aliases]
     Schedule[Daily 06:15 IST] --> Discovery[Workflow A]
@@ -32,11 +37,14 @@ flowchart LR
 ```
 
 Locally, Docker Compose runs PostgreSQL 17, LocalStack S3/SQS, the FastAPI
-upload service, a polling ingestion worker, and n8n. On AWS, `serverless.yml`
-maps that boundary to API Gateway, an API Lambda, an ingestion Lambda, a
-schema-init Lambda, S3, SQS, and private RDS. The CSV never passes through the
-API. n8n stays self-hosted either way, and SES is called by the n8n AWS SES
-node.
+upload service, a polling ingestion worker, and n8n. The worker runs
+deterministic matching in process, then posts the handoff to n8n. On AWS,
+`serverless.yml` maps that boundary to API Gateway, an API Lambda, an
+ingestion Lambda, a matching Lambda, a schema-init Lambda, S3, two SQS
+queues, and private RDS. Ingestion enqueues the matching Lambda instead of
+running the join inside the upload invocation. The CSV never passes through
+the API. n8n stays self-hosted either way, and SES is called by the n8n AWS
+SES node.
 
 ## Repository
 
@@ -46,6 +54,9 @@ node.
 | `backend/` | Upload API, streaming CSV ingestion, and thin AWS handlers |
 | `backend/app/aws_api.py` | API Gateway adapter around the FastAPI app |
 | `backend/app/aws_ingest.py` | SQS adapter around the existing ingestion functions |
+| `backend/app/aws_match.py` | SQS adapter for deterministic matching |
+| `backend/app/matching.py` | Deterministic PASS, FAIL, and UNKNOWN rules |
+| `backend/app/matching_service.py` | Set-based numeric join, match writes, and the n8n handoff |
 | `backend/app/aws_schema.py` | Applies `db/schema.sql` to private RDS |
 | `ui/` | Upload page served by the API |
 | `db/schema.sql` | Application schema |
@@ -114,12 +125,12 @@ n8n stores its own data in the `n8n` database. Application tables live in
 | `matches` | One eligibility result per user and product. `notified_at` stays null until SES accepts the email. |
 | `matching_runs` | Counts that show how much work SQL, rules, and the model each did. |
 
-Required CSV columns are `user_id`, `email`, `monthly_income`,
-`credit_score`, `employment_status`, and `age`. Extra columns are ignored and
-are not stored. The official assignment sample includes a `name` column, and
-that file is accepted. A missing required column, a duplicate header, or a
-duplicate `user_id` inside one batch fails the batch. A null product limit
-means the source did not state that limit. It does not reject the user.
+Required CSV columns are `user_id`, `name`, `email`, `monthly_income`,
+`credit_score`, `employment_status`, and `age`. `name` must be non-empty.
+Extra columns are ignored and are not stored. A missing required column, a
+blank name, a duplicate header, or a duplicate `user_id` inside one batch
+fails the batch. A null product limit means the source did not state that
+limit. It does not reject the user.
 `schema.sql` is additive, so applying it again does not drop products or
 matches.
 
@@ -227,22 +238,25 @@ fill only a field that is still unknown.
 
 ## Workflow B — user and loan matching
 
-`n8n/workflows/user-loan-matching.json` starts when ingestion finishes. The
-worker POSTs `{ "batch_id": "..." }` to
-`http://n8n:5678/webhook/user-loan-matching` with `X-Webhook-Secret`. The
-workflow accepts only a completed batch and pages it by user id. Page size is
-2000. It does not load every user and every product into n8n, and it does not
-build the email.
+`n8n/workflows/user-loan-matching.json` starts after the matching service
+finishes the deterministic stage. The service POSTs the batch metrics and
+only the unresolved qualitative checks to
+`http://n8n:5678/webhook/user-loan-matching` with `X-Webhook-Secret`. A bare
+`batch_id` is rejected, so an old caller cannot delete matches. The workflow
+accepts only a completed batch. User pages stay at 2000 inside the matching
+service. n8n does not load the user rows, and it does not build the email.
 
 ```text
-Ingestion webhook
-  -> validate batch_id and completed status
-  -> keyset page list
-  -> each page:
-       SQL numeric candidate join
-       -> deterministic employment and qualitative classification
-       -> Gemini only for wording the CSV can answer
-       -> upsert matches
+Matching service
+  -> one set-based SQL join for income, credit score, and age
+  -> deterministic employment and qualitative classification
+  -> upsert resolved PASS matches
+  -> POST unresolved checks, or an empty check list
+Workflow B
+  -> validate the handoff and completed status
+  -> Gemini only when unresolved checks were posted
+  -> validate PASS, FAIL, or UNKNOWN
+  -> upsert those matches
   -> delete unnotified matches this run no longer supports
   -> matching_runs and optimization summary
   -> POST batch_id to Workflow C
@@ -251,30 +265,35 @@ Ingestion webhook
 
 The handoff calls `http://127.0.0.1:5678/webhook/user-notification` with the
 same secret. If that call fails, the match rows stay saved and Workflow C can
-be posted again with the same `batch_id`.
+be posted again with the same `batch_id`. The matching webhook waits until
+this workflow finishes, so a failed n8n run can be retried. Workflow C itself
+still accepts the request immediately and sends mail after that.
 
 ### Multi-stage optimization
 
 The matcher does not send the full user×product set to a model.
 
-1. **SQL.** PostgreSQL joins one page of users to active products and applies
-   only hard numeric limits: minimum monthly income, credit-score minimum and
-   maximum, and age minimum and maximum. A null limit is unknown, so it does
-   not reject the user. Income is compared only when the product currency is
-   USD. A non-USD product that states an income floor is skipped and is not
-   called eligible. n8n receives the surviving candidates, not the Cartesian
-   product.
-2. **Deterministic checks.** Employment uses three-valued logic. An empty
-   accepted-status list is `UNKNOWN`, not a pass. A recognized status outside
-   the list is `FAIL` and the pair stops. An unrecognized status stays
-   `UNKNOWN`. Qualitative sentences are classified the same way. SSN, address,
-   residency, citizenship, visa, photo ID, bank account, credit usage, and
-   payment history are `UNKNOWN` because the CSV has no such columns, and they
-   are not sent to a model. An email-only requirement can pass from the email
+1. **SQL.** PostgreSQL joins the batch's users to active products in one
+   set-based query and applies only hard numeric limits: minimum monthly
+   income, credit-score minimum and maximum, and age minimum and maximum. A
+   null limit is unknown, so it does not reject the user. Income is compared
+   only when the product currency is USD. A non-USD product that states an
+   income floor is skipped and is not called eligible. The application reads
+   that result in pages of 2000. It does not recheck the numeric limits in
+   Python.
+2. **Deterministic checks.** The Python matching service uses the same
+   three-valued logic the workflow used to run. An empty accepted-status list
+   is `UNKNOWN`, not a pass. A recognized status outside the list is `FAIL`
+   and the pair stops. An unrecognized status stays `UNKNOWN`. Qualitative
+   sentences are classified the same way. SSN, address, residency,
+   citizenship, visa, photo ID, bank account, credit usage, and payment
+   history are `UNKNOWN` because the CSV has no such columns, and they are
+   not sent to a model. An email-only requirement can pass from the email
    column. A sentence that also requires a device or an online finalization
-   stays `UNKNOWN`. Numeric rules are never delegated to the model.
+   stays `UNKNOWN`. Resolved pairs are upserted here. Numeric rules are never
+   delegated to the model.
 3. **Bounded LLM checks.** Only employment wording that is not already decided
-   by a structured status list is eligible for Gemini. The model is
+   by a structured status list is posted to n8n for Gemini. The model is
    `gemini-2.5-flash` at temperature 0, with a JSON schema of `PASS`, `FAIL`,
    or `UNKNOWN`. One request covers up to 25 criteria, grouped by user. The
    response is accepted only when the check id, user id, and product id match
@@ -314,10 +333,12 @@ requirements stay `UNKNOWN` without a model call. A normal batch records
 
 The official 10,000-row sample passes the numeric limits these three products
 state, and none of them publish an accepted employment list. Workflow B
-execution 34, batch `0f8c8bab-7bd5-43a7-bf5a-8b2e18b68a40`, therefore recorded
-10,000 users, 3 active products, 30,000 theoretical pairs, 30,000 SQL
-candidates, 30,000 deterministic pairs, 0 LLM calls, 30,000 matches, and 67
-pages. The stages still run. This file does not contain a row that fails them.
+execution 34, batch `0f8c8bab-7bd5-43a7-bf5a-8b2e18b68a40`, was the earlier
+n8n page loop and recorded 10,000 users, 3 active products, 30,000
+theoretical pairs, 30,000 SQL candidates, 30,000 deterministic pairs, 0 LLM
+calls, 30,000 matches, and 67 pages of 150. The same stages still run. The
+matching service now records pages of 2000, so that batch is 5 pages. This
+file does not contain a row that fails the three current products.
 
 ## Workflow C — user notification
 
@@ -391,17 +412,18 @@ curl -sS -X POST http://localhost:5678/webhook/user-notification \
 4. Save a UTF-8 CSV:
 
 ```csv
-user_id,email,monthly_income,credit_score,employment_status,age
-strong,strong@example.com,8000,760,employed,35
-low,low@example.com,1800,640,employed,28
-young,young@example.com,5000,720,employed,17
+user_id,name,email,monthly_income,credit_score,employment_status,age
+strong,Strong Example,strong@example.com,8000,760,employed,35
+low,Low Example,low@example.com,1800,640,employed,28
+young,Young Example,young@example.com,5000,720,employed,17
 ```
 
 5. Open <http://localhost:8000>, upload the file, and wait until the page
    shows the batch completed. The browser PUTs the file to the presigned URL.
    The API response contains a batch id, not the CSV body.
-6. In n8n, open the matching execution. For this three-row file the
-   optimization summary is `theoretical_pairs` 9, `sql_candidates` 4,
+6. In n8n, open the matching execution. Deterministic matching has already
+   written the resolved rows. For this three-row file the optimization
+   summary is `theoretical_pairs` 9, `sql_candidates` 4,
    `deterministic_remaining` 4, `llm_calls` 0, and 4 matches. `young` fails
    the age-18 floor on every product. `low` passes only Upgrade. `strong`
    passes Discover, LendingPoint, and Upgrade.
@@ -422,16 +444,17 @@ gateway is the costly part, on the order of a dollar a day plus data, because
 a Lambda function in a private subnet has no public IP of its own. Local
 Compose is the demonstration path and does not create those resources.
 
-The template places the API, the ingestion function, and the schema function
-in one private subnet. RDS uses two private subnets and accepts port 5432
-only from the Lambda security group. A NAT gateway gives the functions a path
-to SQS, CloudWatch, the CloudFormation response URL, and a public n8n
-webhook. An S3 gateway endpoint keeps bucket traffic off the NAT. The upload
-bucket blocks public access, allows browser `PUT` through CORS, and notifies
-SQS for `uploads/` object-created events. A dead-letter queue receives a
-message after three failed receives. The database password is generated in
-Secrets Manager and injected into the functions. It is not written into git
-or the stack outputs.
+The template places the API, the ingestion function, the matching function,
+and the schema function in one private subnet. RDS uses two private subnets
+and accepts port 5432 only from the Lambda security group. A NAT gateway
+gives the functions a path to SQS, CloudWatch, the CloudFormation response
+URL, and a public n8n webhook. An S3 gateway endpoint keeps bucket traffic
+off the NAT. The upload bucket blocks public access, allows browser `PUT`
+through CORS, and notifies SQS for `uploads/` object-created events. A
+dead-letter queue receives an upload message after three failed receives.
+The matching queue does the same for a failed matching invocation. The
+database password is generated in Secrets Manager and injected into the
+functions. It is not written into git or the stack outputs.
 
 n8n is not part of the CloudFormation stack. From AWS, set
 `N8N_MATCH_WEBHOOK_URL` to a public URL the Lambda function can reach, such
@@ -517,10 +540,12 @@ one email per matched user.
 1. Show the diagram above and the Compose services, or the deployed API URL.
 2. Open Workflow A, run it from **Manual trigger**, and show three products
    with `llm_extractions: 0`. Execution 38 is a recorded success of that run.
-3. For scale, open Workflow B execution 34. The optimization summary is
-   10,000 users, 3 products, 30,000 theoretical pairs, 30,000 SQL candidates,
-   30,000 deterministic pairs, 0 LLM calls, 30,000 matches, and 67 pages of
-   150. The notification handoff on that run timed out. Do not retry it.
+3. For scale, open Workflow B execution 34. That run used the earlier n8n
+   page loop. The optimization summary is 10,000 users, 3 products, 30,000
+   theoretical pairs, 30,000 SQL candidates, 30,000 deterministic pairs, 0
+   LLM calls, 30,000 matches, and 67 pages of 150. The notification handoff
+   on that run timed out. Do not retry it. A current run of the same file
+   records 5 pages of 2000 and does the deterministic work before n8n.
 4. For the live email, upload the three-row CSV when you want the age and
    income floors to remove pairs. Upload a one-row file such as `demo001`
    when you want a single recipient. That user, at income 5000 and age 30,
