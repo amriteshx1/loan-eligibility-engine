@@ -10,6 +10,7 @@ import psycopg
 from .db import (
     claim_pending_batch,
     connection,
+    get_batch_by_object_key,
     mark_batch_completed,
     mark_batch_failed,
 )
@@ -20,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = {
     "user_id",
+    "name",
     "email",
     "monthly_income",
     "credit_score",
@@ -78,7 +80,8 @@ def _integer_value(
 def _validated_row(
     row: dict[str, str | None],
     line: int,
-) -> tuple[str, str, Decimal, int, str, int]:
+) -> tuple[str, str, str, Decimal, int, str, int]:
+    name = _required_text(row, "name", line)
     email = _required_text(row, "email", line)
     if "@" not in email:
         raise CsvValidationError(f"Line {line}: email is invalid.")
@@ -89,6 +92,7 @@ def _validated_row(
 
     return (
         _required_text(row, "user_id", line),
+        name,
         email,
         _decimal_value(row, "monthly_income", line),
         _integer_value(row, "credit_score", line, 0, 1000),
@@ -123,6 +127,7 @@ def _copy_users(batch_id: UUID, object_key: str) -> int:
                 COPY users (
                     batch_id,
                     user_id,
+                    name,
                     email,
                     monthly_income,
                     credit_score,
@@ -143,10 +148,24 @@ def _copy_users(batch_id: UUID, object_key: str) -> int:
     return row_count
 
 
+def _resume_matching(object_key: str) -> None:
+    batch = get_batch_by_object_key(object_key)
+    if batch is None or batch["status"] != "completed":
+        LOGGER.info(
+            "Ignoring event for unknown or already claimed object %s", object_key
+        )
+        return
+    if batch["workflow_triggered_at"] is not None:
+        LOGGER.info("Matching already handed off for batch %s", batch["id"])
+        return
+    LOGGER.info("Resuming matching for completed batch %s", batch["id"])
+    trigger_matching_workflow(batch["id"])
+
+
 def process_uploaded_object(object_key: str) -> None:
     batch = claim_pending_batch(object_key)
     if batch is None:
-        LOGGER.info("Ignoring event for unknown or already claimed object %s", object_key)
+        _resume_matching(object_key)
         return
 
     batch_id = batch["id"]
