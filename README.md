@@ -136,12 +136,12 @@ in the n8n UI and attach them yourself:
 | --- | --- | --- |
 | Loan Engine Postgres | Workflows A, B, and C | Host `postgres`, port `5432`, database `loan_engine`, user `loan_app`, password `local-app-password`, SSL off |
 | Match Webhook Secret | Workflow B ingestion webhook, Workflow B’s notification handoff, Workflow C webhook | Header auth, name `X-Webhook-Secret`, value equal to `N8N_WEBHOOK_SECRET` |
-| Gemini API Key | Workflow B qualitative check | Header auth, name `x-goog-api-key`, value from `GEMINI_API_KEY` |
+| Gemini API Key | Workflow B qualitative check and Workflow A LLM fallback | Header auth, name `x-goog-api-key`, value from `GEMINI_API_KEY` |
 | AWS (IAM) account | Workflow C **Send match email** | AWS credential, no custom endpoint. Region is the SES region where the sender and plus-alias identities are verified. The working demonstration uses `us-west-2`. The CloudFormation stack stays in `us-east-1`. IAM user with `ses:SendEmail` and `ses:SendRawEmail` |
 
-The optional product-discovery fallback uses a Header Auth credential named
-for OpenAI: header `Authorization`, value `Bearer <key>`. Current sources
-leave that path disabled, so the key is not required for the demonstration.
+The optional product-discovery fallback uses the same Gemini API Key
+credential. Current sources leave that path disabled, so a normal
+demonstration does not call it.
 
 Publish a workflow after its credentials are attached. n8n runs the published
 version. Import alone does not register the production webhook. Restart n8n
