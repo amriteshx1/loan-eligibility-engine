@@ -70,7 +70,7 @@ def run() -> None:
                 QueueUrl=queue_url,
                 MaxNumberOfMessages=10,
                 WaitTimeSeconds=5,
-                VisibilityTimeout=300,
+                VisibilityTimeout=960,
             )
         except (BotoCoreError, ClientError):
             LOGGER.exception("Could not receive ingestion events")
