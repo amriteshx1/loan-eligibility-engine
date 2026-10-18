@@ -39,6 +39,19 @@ def create_batch(
         )
 
 
+def get_batch_by_object_key(object_key: str) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, status, workflow_triggered_at
+            FROM ingestion_batches
+            WHERE object_key = %s
+            """,
+            (object_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_batch(batch_id: UUID) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute(
