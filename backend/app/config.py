@@ -39,6 +39,9 @@ class Settings(BaseSettings):
 
     n8n_match_webhook_url: str = ""
     n8n_webhook_secret: str = ""
+    # Empty locally, so the worker runs matching in process. serverless.yml
+    # sets the queue URL and the ingest Lambda only enqueues the match Lambda.
+    match_queue_url: str = ""
 
     @model_validator(mode="after")
     def assemble_database_url(self) -> "Settings":
