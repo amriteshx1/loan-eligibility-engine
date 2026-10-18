@@ -231,7 +231,7 @@ fill only a field that is still unknown.
 worker POSTs `{ "batch_id": "..." }` to
 `http://n8n:5678/webhook/user-loan-matching` with `X-Webhook-Secret`. The
 workflow accepts only a completed batch and pages it by user id. Page size is
-150. It does not load every user and every product into n8n, and it does not
+2000. It does not load every user and every product into n8n, and it does not
 build the email.
 
 ```text
