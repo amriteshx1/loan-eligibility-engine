@@ -32,7 +32,7 @@ SELECT
         MAX(id) AS last_id,
         COUNT(*)::int AS users_in_page
       FROM (
-        SELECT id, ((ROW_NUMBER() OVER (ORDER BY id) - 1) / 150)::int AS page_index
+        SELECT id, ((ROW_NUMBER() OVER (ORDER BY id) - 1) / 2000)::int AS page_index
         FROM users
         WHERE batch_id = requested.id
       ) numbered
