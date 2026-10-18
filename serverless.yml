@@ -1,7 +1,9 @@
 # AWS shape of the local pipeline.
 # API Gateway serves the existing FastAPI app. The browser uploads the CSV
-# directly to S3. S3 notifies SQS, and a second Lambda calls the same
-# ingestion functions as the local worker. n8n and SES stay outside this stack.
+# directly to S3. S3 notifies SQS, and the ingestion Lambda calls the same
+# ingestion functions as the local worker. A matching Lambda runs the
+# set-based numeric filter and deterministic checks, then posts unresolved
+# qualitative cases to n8n. n8n and SES stay outside this stack.
 service: loan-eligibility-engine-final
 frameworkVersion: "3"
 
@@ -38,6 +40,8 @@ provider:
           - ":SecretString:password}}"
     N8N_MATCH_WEBHOOK_URL: ${env:N8N_MATCH_WEBHOOK_URL, ''}
     N8N_WEBHOOK_SECRET: ${env:N8N_WEBHOOK_SECRET, ''}
+    MATCH_QUEUE_URL:
+      Ref: MatchQueue
   vpc:
     securityGroupIds:
       - Ref: LambdaSecurityGroup
@@ -64,6 +68,19 @@ provider:
             - sqs:ChangeMessageVisibility
           Resource:
             - arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.queueName}
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource:
+            - arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.matchQueueName}
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ChangeMessageVisibility
+          Resource:
+            - arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.matchQueueName}
 
 plugins:
   - serverless-python-requirements
@@ -83,6 +100,7 @@ package:
 custom:
   bucketName: ${self:service}-${sls:stage}-${aws:accountId}
   queueName: ${self:service}-${sls:stage}-uploads
+  matchQueueName: ${self:service}-${sls:stage}-matching
   pythonRequirements:
     fileName: backend/requirements.txt
     dockerizePip: non-linux
@@ -129,6 +147,21 @@ functions:
     memorySize: 256
     dependsOn:
       - PrivateDefaultRoute
+  match:
+    handler: backend.app.aws_match.handler
+    description: Deterministic loan matching for a completed batch
+    timeout: 900
+    memorySize: 2048
+    dependsOn:
+      - PrivateDefaultRoute
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - MatchQueue
+              - Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
 
 resources:
   Resources:
@@ -326,6 +359,22 @@ resources:
         MultiAZ: false
         DeletionProtection: false
 
+    MatchDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.matchQueueName}-dlq
+        MessageRetentionPeriod: 1209600
+
+    MatchQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.matchQueueName}
+        VisibilityTimeout: 960
+        MessageRetentionPeriod: 1209600
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt MatchDeadLetterQueue.Arn
+          maxReceiveCount: 3
+
     UploadDeadLetterQueue:
       Type: AWS::SQS::Queue
       Properties:
@@ -421,6 +470,9 @@ resources:
     UploadQueueUrl:
       Description: Ingestion queue
       Value: !Ref UploadQueue
+    MatchQueueUrl:
+      Description: Deterministic matching queue
+      Value: !Ref MatchQueue
     DatabaseEndpoint:
       Description: Private RDS endpoint
       Value: !GetAtt Database.Endpoint.Address
